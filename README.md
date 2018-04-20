@@ -8,3 +8,4 @@ Quickstart
 // clients can verify if specific messages are actually from a user by checking the signature against their public key list, e.g. https://github.com/howardchung.keys
 // add voting features if desired
 // have users do JS hashes in the background (opt-in) to generate a currency/voting/posting power?
+// Save git history of each submitted message
