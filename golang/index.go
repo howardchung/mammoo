@@ -104,29 +104,6 @@ func main() {
 			// TODO forward these messages to our peers
 		}
 	})
-	/*
-	       else if (json.type === 'init') {
-	       // TODO handle bootstrapping requests
-	       // a peer might ask for a log of all messages sent since X (bootstrapping).
-	       // if we can serve it, send them the data
-	   }
-	*/
 	log.Fatal(http.ListenAndServe(":"+os.Getenv("PORT"), nil))
 
 }
-
-/*
-// Create POST connection to peers, send them messages when our users post them
-//public list of operators, or webrtc p2p communication with socketio signaling
-// TODO organize servers in a ring, use hashing to determine token ranges that each server is responsible for?
-// TODO overlap ranges to provide replication in case nodes drop out of the ring
-const postReq = http.request({hostname: '127.0.0.1', port: 3141, path: '/', method: 'POST'}, res => {});
-setInterval(() => {
-    const msg = 'hi ' + Math.random();
-    postReq.write(JSON.stringify({
-    id: '/test',
-    message: msg,
-    signature: signature(msg),
-    }));
-}, 1000);
-*/
