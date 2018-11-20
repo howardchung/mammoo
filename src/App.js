@@ -3,7 +3,7 @@ import './App.css';
 import querystring from 'querystring';
 import NodeRSA from 'node-rsa';
 
-const API_HOST = 'http://51.15.79.94:3141';
+const API_HOST = process.env.REACT_APP_API_HOST;
 
 class MessageBox extends React.Component {
   render() {
