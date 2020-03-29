@@ -1,5 +1,5 @@
 {
-  "name": "blocktopus-web",
+  "name": "mammoo",
   "version": "0.1.0",
   "private": true,
   "dependencies": {
@@ -13,6 +13,7 @@
     "build": "react-scripts build",
     "test": "react-scripts test --env=jsdom",
     "eject": "react-scripts eject",
+    "dev": "nodemon --watch server server/index",
     "server": "node server/index"
   }
 }
