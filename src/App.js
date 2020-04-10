@@ -3,7 +3,7 @@ import './App.css';
 import querystring from 'querystring';
 import NodeRSA from 'node-rsa';
 
-const API_HOST = process.env.REACT_APP_API_HOST;
+const API_HOST = process.env.REACT_APP_API_HOST || window.location.protocol + '//' + window.location.hostname + ':3141';
 
 class MessageBox extends React.Component {
   render() {
@@ -47,7 +47,10 @@ class App extends Component {
   sendMessage = (data, path) => {
     const pubkey = this.state.rsaKey.exportKey('public');
     const sig = this.state.rsaKey.sign(data, 'hex');
-    window.fetch(API_HOST + '/send', { method: 'POST', body: JSON.stringify({ data, path, pubkey, sig })});
+    window.fetch(API_HOST + '/send', { method: 'POST', headers: {
+      'Content-Type': 'application/json'
+      // 'Content-Type': 'application/x-www-form-urlencoded',
+    }, body: JSON.stringify({ data, path, pubkey, sig })});
     this.setState({...this.state, currReply: ''});
     this.receiveMessages();
   }
