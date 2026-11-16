@@ -735,7 +735,7 @@ function createMessageId(basePath: string): string {
     return `${basePath}/${new Date().toISOString()}-${crypto.randomUUID()}`;
 }
 
-async function resolveValidatedSendPath(rawPath: unknown): Promise<string> {
+function resolveValidatedSendPath(rawPath: unknown): string {
     const str = rawPath == null || rawPath === '' ? '/default' : String(rawPath).trim();
     if (!str.startsWith('/') || str.includes('\\')) {
         throw new Error('Invalid path');
@@ -748,15 +748,7 @@ async function resolveValidatedSendPath(rawPath: unknown): Promise<string> {
     if (board !== segments[0]) {
         throw new Error('Invalid board name in path');
     }
-    if (segments.length === 1) {
-        return `/${board}`;
-    }
-    const normalized = `/${segments.join('/')}`;
-    const boardMessages = await readMessageLog(board);
-    if (!boardMessages.some((m) => m.id === normalized)) {
-        throw new Error('Parent message not found');
-    }
-    return normalized;
+    return `/${segments.join('/')}`;
 }
 
 // Publishes a client-signed message to this instance
@@ -775,7 +767,7 @@ apiRouter.post('/send', async (req, res) => {
         }
         let basePath: string;
         try {
-            basePath = await resolveValidatedSendPath(json.path);
+            basePath = resolveValidatedSendPath(json.path);
         } catch (pathErr) {
             return res.status(400).json({ error: (pathErr as Error).message });
         }
