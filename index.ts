@@ -1,9 +1,8 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import dgram from 'node:dgram';
 import https from 'node:https';
-import { on } from 'node:events';
 import express from 'express';
 import type { Request } from 'express';
 import cors from 'cors';
@@ -18,6 +17,7 @@ import { CID } from 'multiformats/cid';
 import { buildMessageSignaturePayload, renderForumPage } from './views/forum.ts';
 import type { ForumMessage, PowProof } from './views/forum.ts';
 import startFirehose from './firehose.ts';
+import type { FediverseStatus } from './firehose.ts';
 import { createActivityPubRouter } from './activitypub.ts';
 import {
     bootstrapFromPeer,
@@ -571,14 +571,74 @@ apiRouter.post('/cred', async (req, res) => {
 });
 
 const PORT = Number(process.env.PORT) || 3141;
-let domain = process.env.DOMAIN || '';
+let discoveredHost = '';
+
+function isPrivateIpv4(ip: string): boolean {
+    const parts = ip.split('.').map(Number);
+    if (parts.length !== 4 || parts.some((n) => Number.isNaN(n))) return true;
+    const [a, b] = parts;
+    return (
+        a === 10 ||
+        a === 127 ||
+        (a === 172 && b >= 16 && b <= 31) ||
+        (a === 192 && b === 168) ||
+        (a === 169 && b === 254) ||
+        (a === 100 && b >= 64 && b <= 127)
+    );
+}
+
+function getLocalInterfaceIp(): string {
+    let privateFallback = '';
+    const interfaces = os.networkInterfaces();
+    for (const addrs of Object.values(interfaces)) {
+        for (const addr of addrs || []) {
+            if (addr.internal || addr.family !== 'IPv4') continue;
+            if (!isPrivateIpv4(addr.address)) {
+                return addr.address;
+            }
+            if (!privateFallback) {
+                privateFallback = addr.address;
+            }
+        }
+    }
+    return privateFallback;
+}
+
+async function resolvePublicHost(): Promise<void> {
+    if (process.env.PUBLIC_URL) return;
+    const nicIp = getLocalInterfaceIp();
+    if (nicIp && !isPrivateIpv4(nicIp)) {
+        discoveredHost = nicIp;
+        console.log('Public IP detected from network interface:', discoveredHost);
+        return;
+    }
+    try {
+        const res = await fetch('https://api.ipify.org', { signal: AbortSignal.timeout(3000) });
+        if (res.ok) {
+            const ip = (await res.text()).trim();
+            if (/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) {
+                discoveredHost = ip;
+                console.log('Public IP discovered:', discoveredHost);
+                return;
+            }
+        }
+    } catch {
+        // Fall back to private NIC IP or localhost
+    }
+    if (nicIp) {
+        discoveredHost = nicIp;
+    }
+}
+
+void resolvePublicHost();
 
 function getSelfUrl(): string {
     if (process.env.PUBLIC_URL) {
         return process.env.PUBLIC_URL.replace(/\/+$/, '');
     }
     const scheme = process.env.SSL_KEY_PATH && process.env.SSL_CERT_PATH ? 'https' : 'http';
-    return `${scheme}://${domain || 'localhost'}:${PORT}`;
+    const host = discoveredHost || getLocalInterfaceIp() || 'localhost';
+    return `${scheme}://${host}:${PORT}`;
 }
 
 const bootstrapDeps = {
@@ -597,72 +657,14 @@ const bootstrapDeps = {
 
 apiRouter.use(createBootstrapRouter(bootstrapDeps, { getSelfUrl }));
 
-/**
- * Queries a STUN server (RFC 5389 Binding Request) to discover our public IPv4 address.
- */
-async function getPublicIpViaStun(host: string = 'stun.l.google.com', port: number = 19302, timeoutMs: number = 3000): Promise<string> {
-  const socket = dgram.createSocket('udp4');
-  const tid = crypto.randomBytes(12);
-  const req = Buffer.alloc(20);
-  req.writeUInt16BE(0x0001, 0); // Binding Request
-  req.writeUInt16BE(0x0000, 2); // Message Length
-  req.writeUInt32BE(0x2112a442, 4); // Magic Cookie
-  tid.copy(req, 8);
-
-  try {
-    socket.send(req, port, host);
-    for await (const [msg] of on(socket, 'message', { signal: AbortSignal.timeout(timeoutMs) })) {
-      if (msg.length < 20 || !msg.subarray(8, 20).equals(tid)) continue;
-      let offset = 20;
-      while (offset + 4 <= msg.length) {
-        const type = msg.readUInt16BE(offset);
-        const len = msg.readUInt16BE(offset + 2);
-        if (offset + 4 + len > msg.length) break;
-        const family = len >= 8 ? msg[offset + 5] : 0;
-        if (type === 0x0020 && family === 0x01) { // XOR-MAPPED-ADDRESS (IPv4)
-          return [
-            msg[offset + 8] ^ 0x21,
-            msg[offset + 9] ^ 0x12,
-            msg[offset + 10] ^ 0xa4,
-            msg[offset + 11] ^ 0x42,
-          ].join('.');
-        }
-        if (type === 0x0001 && family === 0x01) { // MAPPED-ADDRESS (IPv4)
-          return [
-            msg[offset + 8],
-            msg[offset + 9],
-            msg[offset + 10],
-            msg[offset + 11],
-          ].join('.');
-        }
-        offset += 4 + ((len + 3) & ~3);
-      }
-      throw new Error('No IPv4 address in STUN response');
-    }
-    throw new Error('STUN socket closed before response');
-  } finally {
+function getDomain(req?: Request): string {
+  if (process.env.PUBLIC_URL) {
     try {
-      socket.close();
+      return new URL(process.env.PUBLIC_URL).host;
     } catch {}
   }
+  return req?.get('host') || `127.0.0.1:${PORT}`;
 }
-
-function getDomain(req?: Request): string {
-  return domain || req?.get('host') || `127.0.0.1:${PORT}`;
-}
-
-async function resolvePublicDomain(): Promise<void> {
-  if (domain) return;
-  try {
-    const ip = await getPublicIpViaStun();
-    domain = `${ip}:${PORT}`;
-    console.log('Public domain resolved via STUN:', domain);
-  } catch (err) {
-    console.warn('STUN lookup failed, falling back to request host:', (err as Error).message);
-  }
-}
-
-resolvePublicDomain();
 
 apiRouter.use(createActivityPubRouter(getDomain));
 
@@ -700,9 +702,94 @@ startPeerDiscovery(bootstrapDeps, { getSelfUrl, intervalMs: discoveryIntervalMs 
   console.error('Peer discovery error:', err);
 });
 
-// BitTorrent DHT removed; peer discovery handled by Helia/libp2p
+interface ServerIdentity {
+  publicKeyPem: string;
+  privateKeyPem: string;
+}
+
+let serverIdentityPromise: Promise<ServerIdentity> | null = null;
+
+function getOrCreateServerIdentity(): Promise<ServerIdentity> {
+  if (!serverIdentityPromise) {
+    serverIdentityPromise = (async () => {
+      const keyPath = path.join(IPFS_DATA_DIR, 'server-key.json');
+      try {
+        const raw = await fs.promises.readFile(keyPath, 'utf8');
+        const parsed = JSON.parse(raw) as ServerIdentity;
+        if (parsed.publicKeyPem && parsed.privateKeyPem) {
+          return parsed;
+        }
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+      }
+
+      const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
+      const identity: ServerIdentity = {
+        publicKeyPem: publicKey.export({ type: 'spki', format: 'pem' }).toString(),
+        privateKeyPem: privateKey.export({ type: 'pkcs8', format: 'pem' }).toString(),
+      };
+      await fs.promises.mkdir(path.dirname(keyPath), { recursive: true });
+      await fs.promises.writeFile(keyPath, JSON.stringify(identity, null, 2), { mode: 0o600 });
+      return identity;
+    })();
+  }
+  return serverIdentityPromise;
+}
+
+function signServerPayload(payload: string, privateKeyPem: string): string {
+  const signer = crypto.createSign('RSA-SHA256');
+  signer.update(payload);
+  signer.end();
+  return signer.sign(privateKeyPem, 'hex');
+}
+
+async function routeFirehoseStatus(status: FediverseStatus, host: string): Promise<void> {
+  const rawTags = Array.isArray(status.tags) ? status.tags : [];
+  const boards = new Set<string>();
+  for (const tag of rawTags) {
+    const rawName = typeof tag?.name === 'string' ? tag.name.trim().toLowerCase() : '';
+    if (!rawName) continue;
+    const cleaned = rawName.replace(/[^a-zA-Z0-9_-]/g, '');
+    if (cleaned) {
+      boards.add(sanitizeBoard(cleaned));
+    }
+  }
+  if (boards.size === 0) return;
+
+  const data = status.content || status.url || status.id;
+  if (!data) return;
+
+  const parsedDate = status.created_at ? new Date(status.created_at) : new Date();
+  const timestamp = Number.isNaN(parsedDate.getTime()) ? new Date().toISOString() : parsedDate.toISOString();
+  const statusHash = crypto
+    .createHash('sha256')
+    .update(String(status.uri || `${host}:${status.id}`))
+    .digest('hex')
+    .slice(0, 16);
+
+  const identity = await getOrCreateServerIdentity();
+  const sig = signServerPayload(buildMessageSignaturePayload(data, null), identity.privateKeyPem);
+
+  for (const board of boards) {
+    const id = `/${board}/${timestamp}-fedi-${statusHash}`;
+    if (await hasMessageId(id)) continue;
+    const msg: MessageRow = {
+      id,
+      depth: 2,
+      data,
+      pubkey: identity.publicKeyPem,
+      sig,
+      content_cid: null,
+    };
+    const saved = await saveMessage(msg);
+    if (saved) {
+      void pushMessageToPeers(msg, getKnownPeers(getSelfUrl()), getSelfUrl());
+    }
+  }
+}
+
 try {
-  await startFirehose();
+  await startFirehose({ onStatus: routeFirehoseStatus });
 } catch (err) {
   console.error('Firehose error:', err);
 }

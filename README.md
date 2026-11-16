@@ -35,12 +35,11 @@ Ports
 * **Outbound:**
   * **Peer HTTP/HTTPS ports** (e.g. `3141`, `443`) — Peer sync (`/api/bootstrap`, `/api/receive`, `/ipfs/:cid`).
   * **IPFS / libp2p peers** (typically TCP/UDP `4001` and advertised peer ports) — DHT rendezvous and Bitswap.
-  * **UDP `19302`** — Outbound STUN lookup to `stun.l.google.com:19302` when `DOMAIN` is not set.
   * **TCP `443`** — Outbound HTTPS stream for the Mastodon firehose.
 
 TODO
 ====
-* Allow each server to specify the names of boards it is interested in
-* Implement some mechanism for keeping peers in sync (forward messages at send time, with periodic reconciles?)
-* add voting feature
-* Integrate with Mastodon/ActivityPub
+* add upvote/downvote (weighted by cred)
+* Mastodon/ActivityPub: read firehose and seed intitial content
+* Mastodon/ActivityPub: publish posts to the Fediverse
+* some kind of pagination
