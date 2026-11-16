@@ -105,6 +105,10 @@ async function sendActivityPub(acct, message, follower) {
 
 window.pachytalkSendActivityPub = sendActivityPub;
 
+const POW_STORAGE_KEY = 'pachytalk_pow_proofs';
+const POW_DIFFICULTY = 4;
+const POW_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
 async function sha256Hex(input) {
   const encoded = new TextEncoder().encode(input);
   const digest = await window.crypto.subtle.digest('SHA-256', encoded);
@@ -119,11 +123,35 @@ function countLeadingZeros(hex) {
   return count;
 }
 
-async function fetchCred(pubkey) {
-  const res = await fetch('/api/cred?pubkey=' + encodeURIComponent(pubkey));
-  if (!res.ok) return 0;
-  const json = await res.json();
-  return Number(json.cred || 0);
+function loadProofsMap() {
+  try {
+    const raw = localStorage.getItem(POW_STORAGE_KEY);
+    return raw ? JSON.parse(raw) : {};
+  } catch {
+    return {};
+  }
+}
+
+function getLocalProofs(pubkey) {
+  const map = loadProofsMap();
+  const list = Array.isArray(map[pubkey]) ? map[pubkey] : [];
+  const cutoff = Date.now() - POW_MAX_AGE_MS;
+  return list.filter((p) => p && typeof p.timestamp === 'number' && p.timestamp >= cutoff);
+}
+
+function saveLocalProof(pubkey, proof) {
+  const map = loadProofsMap();
+  const list = getLocalProofs(pubkey);
+  if (!list.some((p) => p.hash === proof.hash)) {
+    list.push(proof);
+  }
+  map[pubkey] = list;
+  localStorage.setItem(POW_STORAGE_KEY, JSON.stringify(map));
+  return list;
+}
+
+function sumProofCred(proofs) {
+  return proofs.reduce((sum, p) => sum + Number(p.cred || 0), 0);
 }
 
 async function init() {
@@ -137,9 +165,12 @@ async function init() {
   if (pubkeyEl) {
     pubkeyEl.textContent = currentIdentity.publicKeyPem;
   }
-  if (credEl) {
-    credEl.textContent = String(await fetchCred(currentIdentity.publicKeyPem));
-  }
+  const updateCredDisplay = () => {
+    if (credEl) {
+      credEl.textContent = String(sumProofCred(getLocalProofs(currentIdentity.publicKeyPem)));
+    }
+  };
+  updateCredDisplay();
 
   let miningActive = false;
 
@@ -147,40 +178,26 @@ async function init() {
     let hashes = 0;
     while (miningActive) {
       const targetPubkey = currentIdentity.publicKeyPem;
-      const challengeRes = await fetch('/api/pow/challenge', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ pubkey: targetPubkey }),
-      });
-      const challengeJson = await challengeRes.json();
-      if (!challengeRes.ok || !challengeJson.challenge) {
-        throw new Error(challengeJson.error || 'Failed to get PoW challenge');
-      }
-
-      const { challenge, difficulty } = challengeJson;
+      const timestamp = Date.now();
       let nonce = 0;
       while (miningActive && targetPubkey === currentIdentity.publicKeyPem) {
-        const hash = await sha256Hex(`${challenge}:${nonce}`);
+        const hash = await sha256Hex(`${targetPubkey}:${timestamp}:${nonce}`);
         hashes++;
-        if (countLeadingZeros(hash) >= difficulty) {
-          const submitRes = await fetch('/api/pow/submit', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              challenge,
-              nonce: String(nonce),
-              pubkey: targetPubkey,
-            }),
+        const leadingZeros = countLeadingZeros(hash);
+        if (leadingZeros >= POW_DIFFICULTY) {
+          const cred = Math.pow(2, leadingZeros - POW_DIFFICULTY);
+          const proofs = saveLocalProof(targetPubkey, {
+            timestamp,
+            nonce,
+            hash,
+            leadingZeros,
+            cred,
           });
-          const submitJson = await submitRes.json();
-          if (!submitRes.ok) {
-            throw new Error(submitJson.error || 'PoW verification failed');
-          }
-          if (credEl && targetPubkey === currentIdentity.publicKeyPem) {
-            credEl.textContent = String(submitJson.cred);
+          if (targetPubkey === currentIdentity.publicKeyPem) {
+            updateCredDisplay();
           }
           if (powStatusEl) {
-            powStatusEl.textContent = `Verified (+${submitJson.awarded} cred, ${hashes} hashes)`;
+            powStatusEl.textContent = `Mined +${cred} cred (${proofs.length} proofs, ${hashes} hashes)`;
           }
           break;
         }
@@ -222,9 +239,7 @@ async function init() {
         if (pubkeyEl) {
           pubkeyEl.textContent = currentIdentity.publicKeyPem;
         }
-        if (credEl) {
-          credEl.textContent = String(await fetchCred(currentIdentity.publicKeyPem));
-        }
+        updateCredDisplay();
       } finally {
         newIdBtn.disabled = false;
       }
@@ -265,6 +280,27 @@ async function init() {
 
         const payloadToSign = data || imageCid || '';
         const sig = await signText(payloadToSign, currentIdentity.privateKey);
+        const localProofs = getLocalProofs(currentIdentity.publicKeyPem).map(({ timestamp, nonce }) => ({
+          timestamp,
+          nonce,
+        }));
+
+        let powCid = null;
+        if (localProofs.length > 0) {
+          const powRes = await fetch('/api/pow/upload', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              pubkey: currentIdentity.publicKeyPem,
+              proofs: localProofs,
+            }),
+          });
+          const powJson = await powRes.json();
+          if (!powRes.ok) {
+            throw new Error(powJson.error || 'Failed to upload PoW proofs');
+          }
+          powCid = powJson.pow_cid || null;
+        }
 
         const sendRes = await fetch('/api/send', {
           method: 'POST',
@@ -275,6 +311,7 @@ async function init() {
             pubkey: currentIdentity.publicKeyPem,
             sig,
             image_cid: imageCid,
+            pow_cid: powCid,
           }),
         });
         const sendJson = await sendRes.json();

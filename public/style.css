@@ -149,6 +149,16 @@ body {
   word-break: break-all;
 }
 
+.message-cred {
+  display: inline-block;
+  margin-top: 6px;
+  padding: 2px 10px;
+  font-size: 0.78rem;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-radius: 999px;
+}
+
 .message-data {
   margin: 10px 0;
   font-size: 0.98rem;

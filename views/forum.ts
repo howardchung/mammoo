@@ -1,3 +1,11 @@
+export interface PowProof {
+  timestamp: number;
+  nonce: number;
+  hash?: string;
+  leadingZeros?: number;
+  cred?: number;
+}
+
 export interface ForumMessage {
   id: string;
   depth?: number;
@@ -5,6 +13,9 @@ export interface ForumMessage {
   pubkey?: string;
   sig?: string;
   image_cid?: string | null;
+  pow_cid?: string | null;
+  pow?: PowProof[];
+  cred?: number;
 }
 
 export interface ForumPageProps {
@@ -41,11 +52,16 @@ function renderMessage(message: ForumMessage, board: string, replyTo: string, ip
       </div>`
     : '';
 
+  const renderedCred = message.cred && message.cred > 0
+    ? `<div class="message-cred">Verified Cred: <strong>${escapeHtml(message.cred)}</strong></div>`
+    : '';
+
   return `
     <div class="message-card" style="margin-left: ${indentation}px;">
       <pre class="message-json">${escapeHtml(JSON.stringify(message, null, 2))}</pre>
       <div class="message-meta">${escapeHtml(id)}</div>
       <div class="message-meta">${escapeHtml(leafId)}</div>
+      ${renderedCred}
       <div class="message-data">${escapeHtml(message.data)}</div>${renderedImage}
       <details class="reply-details"${isOpen}>
         <summary class="reply-btn">Reply</summary>
