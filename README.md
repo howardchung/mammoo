@@ -24,6 +24,7 @@ On startup, the new instance fetches `/api/bootstrap` from `BOOTSTRAP_URL`, dial
 TODO
 ====
 * Allow each server to specify the names of boards it is interested in
+* Implement some mechanism for keeping peers in sync (forward messages at send time, with periodic reconciles?)
 * add voting feature
 * have users do JS hashes in the background (opt-in) to generate a currency/voting/posting power?
 * Integrate with Mastodon/ActivityPub
