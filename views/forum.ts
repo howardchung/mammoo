@@ -1,22 +1,30 @@
 import crypto from 'node:crypto';
 
 export interface PowProof {
-  timestamp: number;
   nonce: number;
-  hash?: string;
-  leadingZeros?: number;
-  cred?: number;
+}
+
+export type MediaType = 'image' | 'video' | 'audio' | 'file';
+
+export function buildMessageSignaturePayload(
+  data?: string | null,
+  contentCid?: string | null
+): string {
+  return JSON.stringify({
+    data: data || '',
+    content_cid: contentCid || null,
+  });
 }
 
 export interface ForumMessage {
   id: string;
+  cid?: string;
   depth?: number;
   data: string;
   pubkey?: string;
   sig?: string;
-  image_cid?: string | null;
-  pow_cid?: string | null;
-  pow?: PowProof[];
+  content_cid?: string | null;
+  media_type?: MediaType | null;
   cred?: number;
 }
 
@@ -25,6 +33,7 @@ export interface ForumPageProps {
   messages: ForumMessage[];
   replyTo: string;
   ipfsGatewayUrl: string;
+  powDifficultyBits?: number;
 }
 
 const ADJECTIVES = [
@@ -120,23 +129,31 @@ function renderMessage(node: ThreadNode, board: string, replyTo: string, ipfsGat
   const { message, children } = node;
   const id = message.id || '';
   const isOpen = replyTo === id ? ' open' : '';
-  const imageUrl = message.image_cid
-    ? `${ipfsGatewayUrl}/${encodeURIComponent(message.image_cid)}`
+  const mediaUrl = message.content_cid
+    ? `${ipfsGatewayUrl}/${encodeURIComponent(message.content_cid)}`
     : '';
-  const renderedImage = imageUrl
+  const renderedMediaBody = message.media_type === 'video'
+    ? `<video controls preload="metadata" src="${escapeHtml(mediaUrl)}"></video>`
+    : message.media_type === 'audio'
+      ? `<audio controls preload="metadata" src="${escapeHtml(mediaUrl)}"></audio>`
+      : message.media_type === 'file'
+        ? `<a class="message-file" href="${escapeHtml(mediaUrl)}" target="_blank" rel="noopener noreferrer">Download attachment</a>`
+        : `<a href="${escapeHtml(mediaUrl)}" target="_blank" rel="noopener noreferrer">
+            <img src="${escapeHtml(mediaUrl)}" alt="Uploaded image" loading="lazy">
+          </a>`;
+  const renderedImage = mediaUrl
     ? `
       <div class="message-image">
-        <a href="${escapeHtml(imageUrl)}" target="_blank" rel="noopener noreferrer">
-          <img src="${escapeHtml(imageUrl)}" alt="Uploaded image" loading="lazy">
-        </a>
-        <div class="message-cid">IPFS: ${escapeHtml(message.image_cid)}</div>
+        ${renderedMediaBody}
+        <div class="message-cid">IPFS: ${escapeHtml(message.content_cid)}</div>
       </div>`
     : '';
 
   const author = deriveUsername(message.pubkey);
   const avatarUri = deriveAvatarDataUri(message.pubkey);
+  const credTooltip = 'Cred is verifiable proof-of-work mined for this public key.';
   const renderedCred = message.cred && message.cred > 0
-    ? `<span class="message-cred">Verified Cred: <strong>${escapeHtml(message.cred)}</strong></span>`
+    ? `<span class="message-cred" title="${escapeHtml(credTooltip)}">Cred: <strong>${escapeHtml(message.cred)}</strong></span>`
     : '';
 
   const totalReplies = countDescendants(node);
@@ -152,7 +169,7 @@ function renderMessage(node: ThreadNode, board: string, replyTo: string, ipfsGat
 
   return `
     <div class="thread-node">
-      <div class="message-card">
+      <div class="message-card" data-pubkey="${escapeHtml(message.pubkey || '')}">
         <div class="message-header">
           <img class="message-avatar" src="${avatarUri}" alt="${escapeHtml(author)} avatar" width="28" height="28">
           <span class="message-author">${escapeHtml(author)}</span>
@@ -172,7 +189,7 @@ function renderMessage(node: ThreadNode, board: string, replyTo: string, ipfsGat
             <input type="hidden" name="board" value="${escapeHtml(board)}">
             <textarea name="data" placeholder="Reply"></textarea>
             <div class="form-actions">
-              <input type="file" name="image" accept="image/*" class="image-input">
+              <input type="file" name="image" class="image-input">
               <button type="submit">Send</button>
             </div>
           </form>
@@ -182,7 +199,7 @@ function renderMessage(node: ThreadNode, board: string, replyTo: string, ipfsGat
   `;
 }
 
-function renderForumPage({ board, messages, replyTo, ipfsGatewayUrl }: ForumPageProps): string {
+function renderForumPage({ board, messages, replyTo, ipfsGatewayUrl, powDifficultyBits = 16 }: ForumPageProps): string {
   const safeBoard = escapeHtml(board);
   const tree = buildThreadTree(messages);
   const renderedMessages = tree.length
@@ -199,17 +216,26 @@ function renderForumPage({ board, messages, replyTo, ipfsGatewayUrl }: ForumPage
     <script src="/client.js" defer></script>
   </head>
   <body>
-    <div class="app">
+    <div class="app" data-board="${safeBoard}" data-pow-difficulty-bits="${escapeHtml(powDifficultyBits)}">
       <header class="app-header">
         <h2>You're on board ${safeBoard}</h2>
         <div class="header-actions">
           <button type="button" id="new-id-btn">Create New ID</button>
-          <button type="button" id="pow-btn">Start Proof-of-Work</button>
-          <span class="cred-badge">Cred: <strong id="cred-balance">0</strong></span>
-          <span id="pow-status" class="pow-status">Idle</span>
+          <button type="button" id="export-id-btn">Export ID</button>
+          <button type="button" id="import-id-btn">Import ID</button>
+          <input type="file" id="import-id-file" accept=".json,application/json" hidden>
+          <button type="button" id="mine-cred-btn">Mine Cred</button>
+          <span id="cred-mine-status" class="pow-status"></span>
         </div>
         <h3>You're posting as</h3>
-        <pre class="pubkey" id="client-pubkey">Generating client keypair...</pre>
+        <div class="header-identity">
+          <img id="client-avatar" class="message-avatar" alt="Your avatar" width="28" height="28">
+          <span id="client-username" class="message-author">Generating client keypair...</span>
+        </div>
+        <details class="pubkey-details">
+          <summary class="meta-toggle">Public key</summary>
+          <pre class="pubkey" id="client-pubkey">Generating client keypair...</pre>
+        </details>
       </header>
       <main class="messages-container">
         ${renderedMessages}
@@ -219,7 +245,7 @@ function renderForumPage({ board, messages, replyTo, ipfsGatewayUrl }: ForumPage
         <input type="hidden" name="board" value="${safeBoard}">
         <textarea name="data" placeholder="Start a new topic"></textarea>
         <div class="form-actions">
-          <input type="file" name="image" accept="image/*" class="image-input">
+          <input type="file" name="image" class="image-input">
           <button type="submit">Send</button>
         </div>
       </form>

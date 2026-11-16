@@ -15,7 +15,7 @@ import type { UnixFS } from '@helia/unixfs';
 import { FsBlockstore } from 'blockstore-fs';
 import { FsDatastore } from 'datastore-fs';
 import { CID } from 'multiformats/cid';
-import { renderForumPage } from './views/forum.ts';
+import { buildMessageSignaturePayload, renderForumPage } from './views/forum.ts';
 import type { ForumMessage, PowProof } from './views/forum.ts';
 import startFirehose from './firehose.ts';
 import { createActivityPubRouter } from './activitypub.ts';
@@ -27,8 +27,9 @@ interface MessageRow extends ForumMessage {
     data: string;
     pubkey: string;
     sig: string;
-    image_cid: string | null;
-    pow?: PowProof[];
+    content_cid: string | null;
+    media_type?: 'image' | 'video' | 'audio' | 'file' | null;
+    pow?: PowProof | null;
     cred?: number;
     cid?: string;
 }
@@ -44,58 +45,46 @@ const IPFS_GATEWAY_URL = (process.env.IPFS_GATEWAY_URL || '/ipfs').replace(/\/+$
 const IPFS_DATA_DIR = path.resolve(process.env.IPFS_DATA_DIR || path.join(__dirname, 'ipfs-data'));
 const LOGS_DIR = path.resolve(process.env.LOGS_DIR || path.join(IPFS_DATA_DIR, 'logs'));
 const app = express();
-const POW_DIFFICULTY = Number(process.env.POW_DIFFICULTY) || 4;
-const POW_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
-const POW_FUTURE_SKEW_MS = 60 * 1000;
+const POW_DIFFICULTY_BITS = Math.min(63, Math.max(1, Number(process.env.POW_DIFFICULTY_BITS) || 16));
+const POW_BASE_TARGET = 1n << BigInt(64 - POW_DIFFICULTY_BITS);
+const POW_CRED_SCALE = BigInt(Number(process.env.POW_CRED_SCALE) || 1);
 
-function countLeadingHexZeros(hex: string): number {
-    let count = 0;
-    while (count < hex.length && hex[count] === '0') {
-        count++;
+function scoreDigestCred(bytes: Uint8Array): number {
+    const view = new DataView(bytes.buffer, bytes.byteOffset, 8);
+    const h64 = view.getBigUint64(0, false);
+    if (h64 >= POW_BASE_TARGET) {
+        return 0;
     }
-    return count;
+    const scaled = (POW_BASE_TARGET * POW_CRED_SCALE) / (h64 + 1n);
+    return scaled > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(scaled);
 }
 
-function verifyPowProofs(pubkey: string, proofs: unknown): { totalCred: number; validProofs: PowProof[] } {
-    if (!pubkey || !Array.isArray(proofs)) {
-        return { totalCred: 0, validProofs: [] };
+function verifyPubkeyPow(
+    pubkey: string,
+    rawProof: unknown
+): { cred: number; validProof: PowProof | null } {
+    if (!pubkey || rawProof == null) {
+        return { cred: 0, validProof: null };
     }
-    const now = Date.now();
-    const seenHashes = new Set<string>();
-    const validProofs: PowProof[] = [];
-    let totalCred = 0;
-
-    for (const raw of proofs) {
-        if (!raw || typeof raw !== 'object') continue;
-        const { timestamp, nonce } = raw as { timestamp?: unknown; nonce?: unknown };
-        if (typeof timestamp !== 'number' || !Number.isFinite(timestamp)) continue;
-        if (typeof nonce !== 'number' || !Number.isInteger(nonce) || nonce < 0) continue;
-        if (timestamp > now + POW_FUTURE_SKEW_MS || timestamp < now - POW_MAX_AGE_MS) continue;
-
-        const hash = crypto.createHash('sha256').update(`${pubkey}:${timestamp}:${nonce}`).digest('hex');
-        if (seenHashes.has(hash)) continue;
-        const leadingZeros = countLeadingHexZeros(hash);
-        if (leadingZeros < POW_DIFFICULTY) continue;
-
-        seenHashes.add(hash);
-        const cred = Math.pow(2, leadingZeros - POW_DIFFICULTY);
-        totalCred += cred;
-        validProofs.push({ timestamp, nonce, hash, leadingZeros, cred });
+    const nonce = typeof rawProof === 'number'
+        ? rawProof
+        : (typeof rawProof === 'object' ? (rawProof as { nonce?: unknown }).nonce : undefined);
+    if (typeof nonce !== 'number' || !Number.isInteger(nonce) || nonce < 0) {
+        return { cred: 0, validProof: null };
     }
 
-    return { totalCred, validProofs };
+    const digest = crypto.createHash('sha256').update(`${pubkey}:${nonce}`).digest();
+    const cred = scoreDigestCred(digest);
+    if (cred <= 0) {
+        return { cred: 0, validProof: null };
+    }
+
+    return { cred, validProof: { nonce } };
 }
 
 const upload = multer({
     storage: multer.memoryStorage(),
-    limits: { fileSize: 10 * 1024 * 1024 },
-    fileFilter: (_req, file, cb) => {
-        if (file.mimetype && file.mimetype.startsWith('image/')) {
-            cb(null, true);
-        } else {
-            cb(new Error('Only image uploads are allowed'));
-        }
-    },
+    limits: { fileSize: Number(process.env.MAX_UPLOAD_BYTES) || 50 * 1024 * 1024 },
 });
 
 type HeliaNode = ReturnType<typeof createHelia>;
@@ -141,9 +130,93 @@ async function readBytesFromIpfs(cidStr: string): Promise<Buffer> {
     return Buffer.concat(chunks);
 }
 
-const credByPubkey = new Map<string, number>();
+const CREDS_INDEX_PATH = path.join(LOGS_DIR, 'creds.json');
+let credIndexPromise: Promise<Record<string, number>> | null = null;
 
-function attachCredToMessages(messages: MessageRow[]): MessageRow[] {
+function getPubkeyHash(pubkey: string): string {
+    return crypto.createHash('sha256').update(pubkey).digest('hex');
+}
+
+function getCredIndex(): Promise<Record<string, number>> {
+    if (!credIndexPromise) {
+        credIndexPromise = (async () => {
+            try {
+                const raw = await fs.promises.readFile(CREDS_INDEX_PATH, 'utf8');
+                const parsed = JSON.parse(raw);
+                if (!parsed || typeof parsed !== 'object') {
+                    return {};
+                }
+                const out: Record<string, number> = {};
+                for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+                    if (typeof v === 'number' && Number.isInteger(v) && v >= 0) {
+                        out[k] = v;
+                    }
+                }
+                return out;
+            } catch (err) {
+                if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+                    return {};
+                }
+                credIndexPromise = null;
+                throw err;
+            }
+        })();
+    }
+    return credIndexPromise;
+}
+
+async function getPubkeyCred(pubkey: string): Promise<{ cred: number; nonce: number | null }> {
+    if (!pubkey) {
+        return { cred: 0, nonce: null };
+    }
+    const index = await getCredIndex();
+    const nonce = index[getPubkeyHash(pubkey)];
+    if (typeof nonce !== 'number') {
+        return { cred: 0, nonce: null };
+    }
+    const { cred } = verifyPubkeyPow(pubkey, nonce);
+    return { cred, nonce };
+}
+
+async function upsertPubkeyCred(
+    pubkey: string,
+    rawPow: unknown
+): Promise<{ ok: boolean; cred: number; updated: boolean; error?: string }> {
+    if (!pubkey) {
+        return { ok: false, cred: 0, updated: false, error: 'pubkey is required' };
+    }
+    const { cred, validProof } = verifyPubkeyPow(pubkey, rawPow);
+    if (!validProof || cred <= 0) {
+        return { ok: false, cred: 0, updated: false, error: 'Valid PoW proof is required' };
+    }
+    const existing = await getPubkeyCred(pubkey);
+    if (cred <= existing.cred) {
+        return { ok: true, cred: existing.cred, updated: false };
+    }
+    const index = await getCredIndex();
+    index[getPubkeyHash(pubkey)] = validProof.nonce;
+    await fs.promises.mkdir(LOGS_DIR, { recursive: true });
+    await fs.promises.writeFile(CREDS_INDEX_PATH, JSON.stringify(index, null, 2), 'utf8');
+    return { ok: true, cred, updated: true };
+}
+
+async function attachCredToMessages(messages: MessageRow[]): Promise<MessageRow[]> {
+    if (messages.length === 0) {
+        return messages;
+    }
+    const uniquePubkeys = new Set<string>();
+    for (const msg of messages) {
+        if (msg.pubkey) {
+            uniquePubkeys.add(msg.pubkey);
+        }
+    }
+    const credByPubkey = new Map<string, number>();
+    await Promise.all(
+        Array.from(uniquePubkeys).map(async (pk) => {
+            const { cred } = await getPubkeyCred(pk);
+            credByPubkey.set(pk, cred);
+        })
+    );
     return messages.map((msg) => ({
         ...msg,
         cred: credByPubkey.get(msg.pubkey) ?? 0,
@@ -156,15 +229,14 @@ async function listMessagesFromIpfs(prefix?: string): Promise<MessageRow[]> {
         .map((s) => s.trim())
         .filter((s) => s && s !== '.' && s !== '..');
     if (normalized.length === 0) {
-        return attachCredToMessages(await readMessageLog());
+        return readMessageLog();
     }
     const board = sanitizeBoard(normalized[0]);
     const messages = await readMessageLog(board);
     const targetPrefix = `/${[board, ...normalized.slice(1)].join('/')}`;
-    const filtered = messages
+    return messages
         .filter((m) => m.id === targetPrefix || m.id.startsWith(`${targetPrefix}/`))
         .sort((a, b) => a.id.localeCompare(b.id));
-    return attachCredToMessages(filtered);
 }
 
 function getBoardFromId(id: string): string {
@@ -176,83 +248,79 @@ function getBoardLogPath(board: string): string {
     return path.join(LOGS_DIR, `${sanitizeBoard(board)}.log`);
 }
 
-const boardCidSets = new Map<string, Promise<Set<string>>>();
-const postCache = new Map<string, MessageRow>();
+interface BoardLogState {
+    ids: Set<string>;
+    messages: MessageRow[];
+}
 
-function getBoardCidSet(board: string): Promise<Set<string>> {
+const boardLogs = new Map<string, Promise<BoardLogState>>();
+
+function getBoardLogState(board: string): Promise<BoardLogState> {
     const cleanBoard = sanitizeBoard(board);
-    let setPromise = boardCidSets.get(cleanBoard);
-    if (!setPromise) {
-        setPromise = (async () => {
+    let statePromise = boardLogs.get(cleanBoard);
+    if (!statePromise) {
+        statePromise = (async () => {
+            const ids = new Set<string>();
+            const messages: MessageRow[] = [];
             try {
                 const raw = await fs.promises.readFile(getBoardLogPath(cleanBoard), 'utf8');
-                return new Set(
-                    raw
-                        .split('\n')
-                        .map((line) => line.trim())
-                        .filter(Boolean)
-                );
+                for (const rawLine of raw.split('\n')) {
+                    const line = rawLine.trim();
+                    if (!line) continue;
+                    let msg: MessageRow | null = null;
+                    if (line.startsWith('{')) {
+                        msg = JSON.parse(line) as MessageRow;
+                    } else {
+                        // Backwards-compatible fallback for legacy CID-only log lines
+                        const buf = await readBytesFromIpfs(line);
+                        msg = { ...(JSON.parse(buf.toString('utf8')) as MessageRow), cid: line };
+                    }
+                    if (msg && msg.id && !ids.has(msg.id)) {
+                        ids.add(msg.id);
+                        messages.push(msg);
+                    }
+                }
+                return { ids, messages };
             } catch (err) {
                 if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-                    return new Set<string>();
+                    return { ids, messages };
                 }
-                boardCidSets.delete(cleanBoard);
+                boardLogs.delete(cleanBoard);
                 throw err;
             }
         })();
-        boardCidSets.set(cleanBoard, setPromise);
+        boardLogs.set(cleanBoard, statePromise);
     }
-    return setPromise;
+    return statePromise;
 }
 
-async function readBoardCids(board: string, offset: number = 0): Promise<string[]> {
-    const cids = Array.from(await getBoardCidSet(board));
-    return offset > 0 ? cids.slice(offset) : cids;
-}
-
-async function appendCidToBoardLog(board: string, postCid: string): Promise<boolean> {
-    const cleanBoard = sanitizeBoard(board);
-    const cidSet = await getBoardCidSet(cleanBoard);
-    if (cidSet.has(postCid)) {
-        return false;
-    }
-    cidSet.add(postCid);
-    const logPath = getBoardLogPath(cleanBoard);
-    try {
-        await fs.promises.mkdir(path.dirname(logPath), { recursive: true });
-        await fs.promises.appendFile(logPath, `${postCid}\n`, 'utf8');
-        return true;
-    } catch (err) {
-        cidSet.delete(postCid);
-        throw err;
-    }
-}
-
-async function readPostByCid(postCid: string): Promise<MessageRow> {
-    const cached = postCache.get(postCid);
-    if (cached) {
-        return cached;
-    }
-    const buf = await readBytesFromIpfs(postCid);
-    const msg = JSON.parse(buf.toString('utf8')) as MessageRow;
-    const row: MessageRow = { ...msg, cid: postCid };
-    postCache.set(postCid, row);
-    return row;
-}
-
-async function appendMessageLog(message: MessageRow): Promise<string> {
+async function appendMessageLog(message: MessageRow): Promise<boolean> {
     const cleanMessage: MessageRow = {
         id: message.id,
         depth: message.depth,
         data: message.data,
         pubkey: message.pubkey,
         sig: message.sig,
-        image_cid: message.image_cid,
+        content_cid: message.content_cid,
+        ...(message.media_type ? { media_type: message.media_type } : {}),
     };
-    const postCid = await uploadToIpfs(Buffer.from(JSON.stringify(cleanMessage)));
-    postCache.set(postCid, { ...cleanMessage, cid: postCid });
-    await appendCidToBoardLog(getBoardFromId(cleanMessage.id), postCid);
-    return postCid;
+    const board = getBoardFromId(cleanMessage.id);
+    const state = await getBoardLogState(board);
+    if (state.ids.has(cleanMessage.id)) {
+        return false;
+    }
+    state.ids.add(cleanMessage.id);
+    state.messages.push(cleanMessage);
+    const logPath = getBoardLogPath(board);
+    try {
+        await fs.promises.mkdir(path.dirname(logPath), { recursive: true });
+        await fs.promises.appendFile(logPath, `${JSON.stringify(cleanMessage)}\n`, 'utf8');
+        return true;
+    } catch (err) {
+        state.ids.delete(cleanMessage.id);
+        state.messages.pop();
+        throw err;
+    }
 }
 
 async function listBoardsFromDisk(): Promise<string[]> {
@@ -280,24 +348,19 @@ function filterBySince(entries: MessageRow[], since?: string): MessageRow[] {
 }
 
 async function readMessageLog(board?: string, offset: number = 0, since?: string): Promise<MessageRow[]> {
-    if (board) {
-        const cids = await readBoardCids(board, offset);
-        const entries = await Promise.all(cids.map((cid) => readPostByCid(cid)));
-        entries.sort((a, b) => a.id.localeCompare(b.id));
-        return filterBySince(entries, since);
-    }
-    const boards = await listBoardsFromDisk();
-    const allEntries: MessageRow[] = [];
+    const boards = board ? [sanitizeBoard(board)] : await listBoardsFromDisk();
+    const messages: MessageRow[] = [];
     for (const b of boards) {
-        const cids = await readBoardCids(b);
-        const entries = await Promise.all(cids.map((cid) => readPostByCid(cid)));
-        allEntries.push(...filterBySince(entries, since));
+        const state = await getBoardLogState(b);
+        messages.push(...state.messages);
     }
-    allEntries.sort((a, b) => a.id.localeCompare(b.id));
-    return offset > 0 ? allEntries.slice(offset) : allEntries;
+    const withCred = await attachCredToMessages(messages);
+    withCred.sort((a, b) => a.id.localeCompare(b.id));
+    const filtered = filterBySince(withCred, since);
+    return offset > 0 ? filtered.slice(offset) : filtered;
 }
 
-async function saveMessageToIpfs(message: MessageRow): Promise<string> {
+async function saveMessage(message: MessageRow): Promise<boolean> {
     return appendMessageLog(message);
 }
 
@@ -336,6 +399,7 @@ app.get('/', async (req, res) => {
             messages: rows,
             replyTo,
             ipfsGatewayUrl: IPFS_GATEWAY_URL,
+            powDifficultyBits: POW_DIFFICULTY_BITS,
         });
         res.type('html').send(html);
     } catch (e) {
@@ -360,9 +424,33 @@ apiRouter.get('/messages', async (req, res) => {
     }
 });
 
+function detectContentType(buf: Buffer): string {
+    if (buf.length >= 4 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'image/png';
+    if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image/jpeg';
+    if (buf.length >= 4 && buf.subarray(0, 4).toString('ascii') === 'GIF8') return 'image/gif';
+    if (buf.length >= 12 && buf.subarray(0, 4).toString('ascii') === 'RIFF' && buf.subarray(8, 12).toString('ascii') === 'WEBP') return 'image/webp';
+    if (buf.length >= 12 && buf.subarray(0, 4).toString('ascii') === 'RIFF' && buf.subarray(8, 12).toString('ascii') === 'WAVE') return 'audio/wav';
+    if (buf.length >= 8 && buf.subarray(4, 8).toString('ascii') === 'ftyp') return 'video/mp4';
+    if (buf.length >= 4 && buf[0] === 0x1a && buf[1] === 0x45 && buf[2] === 0xdf && buf[3] === 0xa3) return 'video/webm';
+    if (buf.length >= 4 && buf.subarray(0, 4).toString('ascii') === 'OggS') return 'video/ogg';
+    if (buf.length >= 3 && buf.subarray(0, 3).toString('ascii') === 'ID3') return 'audio/mpeg';
+    if (buf.length >= 2 && buf[0] === 0xff && (buf[1] & 0xe0) === 0xe0) return 'audio/mpeg';
+    if (buf.length >= 4 && buf.subarray(0, 4).toString('ascii') === '%PDF') return 'application/pdf';
+    return 'application/octet-stream';
+}
+
+function classifyMediaType(mimetype?: string | null): 'image' | 'video' | 'audio' | 'file' {
+    if (!mimetype) return 'file';
+    if (mimetype.startsWith('video/')) return 'video';
+    if (mimetype.startsWith('audio/')) return 'audio';
+    if (mimetype.startsWith('image/')) return 'image';
+    return 'file';
+}
+
 app.get('/ipfs/:cid', async (req, res) => {
     try {
         const data = await readBytesFromIpfs(String(req.params.cid));
+        res.type(detectContentType(data));
         res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
         return res.send(data);
     } catch (e) {
@@ -374,12 +462,14 @@ app.get('/ipfs/:cid', async (req, res) => {
 apiRouter.post('/upload', upload.single('image'), async (req, res) => {
     try {
         if (!req.file) {
-            return res.status(400).json({ error: 'No image file provided' });
+            return res.status(400).json({ error: 'No file provided' });
         }
         const cid = await uploadToIpfs(req.file.buffer);
+        const mediaType = classifyMediaType(req.file.mimetype);
         return res.json({
             ok: true,
             cid,
+            media_type: mediaType,
             url: `${IPFS_GATEWAY_URL}/${cid}`,
         });
     } catch (e) {
@@ -414,11 +504,11 @@ apiRouter.post('/send', async (req, res) => {
     const json = req.body || {};
     try {
         const data = json.data == null ? '' : String(json.data).trim();
-        const imageCid = typeof json.image_cid === 'string' && json.image_cid ? json.image_cid : null;
-        if (!data && !imageCid) {
-            return res.status(400).json({ error: 'Message data or image_cid is required' });
+        const contentCid = typeof json.content_cid === 'string' && json.content_cid ? json.content_cid : null;
+        if (!data && !contentCid) {
+            return res.status(400).json({ error: 'Message data or content_cid is required' });
         }
-        const signedPayload = data || imageCid || '';
+        const signedPayload = buildMessageSignaturePayload(data, contentCid);
         if (!verifySignature(signedPayload, json.pubkey, json.sig)) {
             return res.status(400).json({ error: 'Invalid signature' });
         }
@@ -431,16 +521,21 @@ apiRouter.post('/send', async (req, res) => {
         const id = createMessageId(basePath);
         const depth = id.split('/').length - 1;
         const pubkey = String(json.pubkey);
-        const cred = credByPubkey.get(pubkey) ?? 0;
-        const cid = await saveMessageToIpfs({
+        const sig = String(json.sig);
+        const validMediaTypes = new Set(['image', 'video', 'audio', 'file']);
+        const mediaType = validMediaTypes.has(json.media_type)
+            ? json.media_type
+            : (contentCid ? 'image' : null);
+        await saveMessage({
             id,
             depth,
             data,
             pubkey,
-            sig: String(json.sig),
-            image_cid: imageCid,
+            sig,
+            content_cid: contentCid,
+            media_type: mediaType,
         });
-        return res.json({ ok: true, id, cid, image_cid: imageCid, cred });
+        return res.json({ ok: true, id, content_cid: contentCid, media_type: mediaType });
     }
     catch(e) {
         console.error(e);
@@ -449,37 +544,38 @@ apiRouter.post('/send', async (req, res) => {
     // TODO forward these messages to our peers
 });
 
+apiRouter.post('/cred', async (req, res) => {
+    const json = req.body || {};
+    try {
+        const pubkey = String(json.pubkey || '');
+        const sig = String(json.sig || '');
+        if (!verifySignature(pubkey, pubkey, sig)) {
+            return res.status(400).json({ error: 'Invalid signature' });
+        }
+        const result = await upsertPubkeyCred(pubkey, json.pow);
+        if (!result.ok) {
+            return res.status(400).json({ error: result.error });
+        }
+        return res.json({ ok: true, pubkey, cred: result.cred, updated: result.updated });
+    } catch (e) {
+        console.error(e);
+        return res.status(500).json({ error: (e as Error).message });
+    }
+});
+
 const bootstrapDeps = {
     sanitizeBoard,
-    getBoardFromId,
+    getPubkeyHash,
     readMessageLog,
-    readBoardCids,
-    listBoardsFromDisk,
+    getCredIndex,
+    upsertPubkeyCred,
     uploadToIpfs,
     verifySignature,
-    appendCidToBoardLog,
-    saveMessageToIpfs,
-    postCache,
+    saveMessage,
     getIpfs,
 };
 
 apiRouter.use(createBootstrapRouter(bootstrapDeps));
-
-apiRouter.post('/pow/verify', (req, res) => {
-    const body = req.body || {};
-    const pubkey = String(body.pubkey || '');
-    if (!pubkey || !Array.isArray(body.proofs)) {
-        return res.status(400).json({ error: 'pubkey and proofs array are required' });
-    }
-    const { totalCred, validProofs } = verifyPowProofs(pubkey, body.proofs);
-    credByPubkey.set(pubkey, totalCred);
-    return res.json({
-        ok: true,
-        cred: totalCred,
-        validCount: validProofs.length,
-        validProofs,
-    });
-});
 
 const PORT = Number(process.env.PORT) || 3141;
 let domain = process.env.DOMAIN || '';

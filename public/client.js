@@ -36,8 +36,44 @@ async function generateAndStoreKeyPair() {
   const publicKeyPem = spkiToPem(spki);
   const privateKeyJwk = await window.crypto.subtle.exportKey('jwk', keyPair.privateKey);
 
-  localStorage.setItem(STORAGE_KEY, JSON.stringify({ publicKeyPem, privateKeyJwk }));
-  return { publicKeyPem, privateKey: keyPair.privateKey };
+  localStorage.setItem(STORAGE_KEY, JSON.stringify({ publicKeyPem, privateKeyJwk, bestPow: null }));
+  return { publicKeyPem, privateKey: keyPair.privateKey, bestPow: null };
+}
+
+function saveBestPowToIdentity(publicKeyPem, bestPow) {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    if (parsed.publicKeyPem !== publicKeyPem) return;
+    parsed.bestPow = bestPow;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(parsed));
+  } catch {
+    // Ignore storage errors
+  }
+}
+
+async function importIdentityFromJson(rawText) {
+  const parsed = JSON.parse(rawText);
+  if (!parsed || typeof parsed.publicKeyPem !== 'string' || !parsed.privateKeyJwk) {
+    throw new Error('Invalid identity file');
+  }
+  const privateKey = await window.crypto.subtle.importKey(
+    'jwk',
+    parsed.privateKeyJwk,
+    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  const bestPow = parsed.bestPow && Number.isInteger(parsed.bestPow.nonce) && parsed.bestPow.nonce >= 0
+    ? { nonce: parsed.bestPow.nonce }
+    : null;
+  localStorage.setItem(STORAGE_KEY, JSON.stringify({
+    publicKeyPem: parsed.publicKeyPem,
+    privateKeyJwk: parsed.privateKeyJwk,
+    bestPow,
+  }));
+  return { publicKeyPem: parsed.publicKeyPem, privateKey, bestPow };
 }
 
 async function getOrCreateKeyPair() {
@@ -53,7 +89,14 @@ async function getOrCreateKeyPair() {
           false,
           ['sign']
         );
-        return { publicKeyPem: parsed.publicKeyPem, privateKey };
+        const bestPow = parsed.bestPow && Number.isInteger(parsed.bestPow.nonce) && parsed.bestPow.nonce >= 0
+          ? { nonce: parsed.bestPow.nonce }
+          : null;
+        return {
+          publicKeyPem: parsed.publicKeyPem,
+          privateKey,
+          bestPow,
+        };
       }
     } catch {
       // Regenerate if stored keypair is corrupt
@@ -105,151 +148,145 @@ async function sendActivityPub(acct, message, follower) {
 
 window.pachytalkSendActivityPub = sendActivityPub;
 
-const POW_STORAGE_KEY = 'pachytalk_pow_proofs';
-const POW_DIFFICULTY = 4;
-const POW_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+const rawDifficultyBits = Number(document.querySelector('.app')?.getAttribute('data-pow-difficulty-bits'));
+const POW_DIFFICULTY_BITS = Number.isInteger(rawDifficultyBits) && rawDifficultyBits >= 1 && rawDifficultyBits <= 63
+  ? rawDifficultyBits
+  : 16;
+const POW_BASE_TARGET = 1n << BigInt(64 - POW_DIFFICULTY_BITS);
+const POW_CRED_SCALE = 1n;
 
-async function sha256Hex(input) {
+async function sha256Bytes(input) {
   const encoded = new TextEncoder().encode(input);
   const digest = await window.crypto.subtle.digest('SHA-256', encoded);
-  return arrayBufferToHex(digest);
+  return new Uint8Array(digest);
 }
 
-function countLeadingZeros(hex) {
-  let count = 0;
-  while (count < hex.length && hex[count] === '0') {
-    count++;
+function scoreDigestCred(bytes) {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, 8);
+  const h64 = view.getBigUint64(0, false);
+  if (h64 >= POW_BASE_TARGET) {
+    return 0;
   }
-  return count;
+  const scaled = (POW_BASE_TARGET * POW_CRED_SCALE) / (h64 + 1n);
+  return scaled > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(scaled);
 }
 
-function loadProofsMap() {
-  try {
-    const raw = localStorage.getItem(POW_STORAGE_KEY);
-    return raw ? JSON.parse(raw) : {};
-  } catch {
-    return {};
+const ADJECTIVES = [
+  'amber', 'brisk', 'calm', 'clear', 'cobalt', 'coral', 'crisp', 'dawn',
+  'ember', 'fern', 'frost', 'gold', 'jade', 'keen', 'lively', 'lunar',
+  'maple', 'misty', 'noble', 'olive', 'opal', 'pine', 'quiet', 'rapid',
+  'river', 'sage', 'silver', 'solar', 'swift', 'teal', 'warm', 'wild',
+];
+
+const NOUNS = [
+  'badger', 'beaver', 'bison', 'bobcat', 'condor', 'crane', 'deer', 'dolphin',
+  'eagle', 'falcon', 'finch', 'fox', 'gecko', 'hawk', 'heron', 'ibis',
+  'jay', 'koala', 'lemur', 'lynx', 'marmot', 'newt', 'osprey', 'otter',
+  'owl', 'panda', 'puma', 'raven', 'robin', 'seal', 'swan', 'wolf',
+];
+
+async function deriveIdentityProfile(pubkey) {
+  const digest = await sha256Bytes(pubkey || 'anonymous');
+  const adj = ADJECTIVES[digest[0] % ADJECTIVES.length];
+  const noun = NOUNS[digest[1] % NOUNS.length];
+  const tag = Array.from(digest.slice(2, 4), (b) => b.toString(16).padStart(2, '0')).join('');
+  const username = pubkey ? `${adj}-${noun}-${tag}` : 'anonymous';
+
+  const hue = ((digest[0] << 8) | digest[1]) % 360;
+  const fg = `hsl(${hue}, 65%, 48%)`;
+  const cells = [];
+  for (let row = 0; row < 5; row++) {
+    for (let col = 0; col < 3; col++) {
+      const bitIndex = row * 3 + col;
+      const byte = digest[2 + Math.floor(bitIndex / 8)];
+      const on = (byte >> (bitIndex % 8)) & 1;
+      if (on) {
+        cells.push(`<rect x="${col + 1}" y="${row + 1}" width="1" height="1" fill="${fg}"/>`);
+        if (col < 2) {
+          cells.push(`<rect x="${5 - col}" y="${row + 1}" width="1" height="1" fill="${fg}"/>`);
+        }
+      }
+    }
   }
-}
-
-function getLocalProofs(pubkey) {
-  const map = loadProofsMap();
-  const list = Array.isArray(map[pubkey]) ? map[pubkey] : [];
-  const cutoff = Date.now() - POW_MAX_AGE_MS;
-  return list.filter((p) => p && typeof p.timestamp === 'number' && p.timestamp >= cutoff);
-}
-
-function saveLocalProof(pubkey, proof) {
-  const map = loadProofsMap();
-  const list = getLocalProofs(pubkey);
-  if (!list.some((p) => p.hash === proof.hash)) {
-    list.push(proof);
-  }
-  map[pubkey] = list;
-  localStorage.setItem(POW_STORAGE_KEY, JSON.stringify(map));
-  return list;
-}
-
-function sumProofCred(proofs) {
-  return proofs.reduce((sum, p) => sum + Number(p.cred || 0), 0);
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 7 7" shape-rendering="crispEdges"><rect width="7" height="7" fill="#f1f5f9"/>${cells.join('')}</svg>`;
+  const avatarUri = `data:image/svg+xml;base64,${btoa(svg)}`;
+  return { username, avatarUri };
 }
 
 async function init() {
   const pubkeyEl = document.getElementById('client-pubkey');
+  const usernameEl = document.getElementById('client-username');
+  const avatarEl = document.getElementById('client-avatar');
   const newIdBtn = document.getElementById('new-id-btn');
-  const powBtn = document.getElementById('pow-btn');
-  const credEl = document.getElementById('cred-balance');
-  const powStatusEl = document.getElementById('pow-status');
+
+  const updateIdentityDisplay = async (pubkey) => {
+    if (pubkeyEl) {
+      pubkeyEl.textContent = pubkey;
+    }
+    const { username, avatarUri } = await deriveIdentityProfile(pubkey);
+    if (usernameEl) {
+      usernameEl.textContent = username;
+    }
+    if (avatarEl) {
+      avatarEl.setAttribute('src', avatarUri);
+      avatarEl.setAttribute('alt', `${username} avatar`);
+    }
+  };
 
   let currentIdentity = await getOrCreateKeyPair();
-  if (pubkeyEl) {
-    pubkeyEl.textContent = currentIdentity.publicKeyPem;
-  }
-  const updateCredDisplay = () => {
-    if (credEl) {
-      credEl.textContent = String(sumProofCred(getLocalProofs(currentIdentity.publicKeyPem)));
-    }
-  };
-  const syncCredToServer = async (pubkey) => {
-    const proofs = getLocalProofs(pubkey).map(({ timestamp, nonce }) => ({
-      timestamp,
-      nonce,
-    }));
-    if (proofs.length === 0) return;
-    try {
-      const res = await fetch('/api/pow/verify', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ pubkey, proofs }),
-      });
-      if (!res.ok) return;
-      const json = await res.json();
-      if (pubkey === currentIdentity.publicKeyPem && credEl && typeof json.cred === 'number') {
-        credEl.textContent = String(json.cred);
-      }
-    } catch {
-      // Keep local display if server sync fails
-    }
-  };
-  updateCredDisplay();
-  syncCredToServer(currentIdentity.publicKeyPem);
+  await updateIdentityDisplay(currentIdentity.publicKeyPem);
 
-  let miningActive = false;
+  const appEl = document.querySelector('.app');
+  const board = appEl?.getAttribute('data-board') || 'default';
+  const exportIdBtn = document.getElementById('export-id-btn');
+  const importIdBtn = document.getElementById('import-id-btn');
+  const importIdFile = document.getElementById('import-id-file');
+  const mineCredBtn = document.getElementById('mine-cred-btn');
+  const mineStatusEl = document.getElementById('cred-mine-status');
 
-  async function runMiningLoop() {
-    let hashes = 0;
-    while (miningActive) {
-      const targetPubkey = currentIdentity.publicKeyPem;
-      const timestamp = Date.now();
-      let nonce = 0;
-      while (miningActive && targetPubkey === currentIdentity.publicKeyPem) {
-        const hash = await sha256Hex(`${targetPubkey}:${timestamp}:${nonce}`);
-        hashes++;
-        const leadingZeros = countLeadingZeros(hash);
-        if (leadingZeros >= POW_DIFFICULTY) {
-          const cred = Math.pow(2, leadingZeros - POW_DIFFICULTY);
-          const proofs = saveLocalProof(targetPubkey, {
-            timestamp,
-            nonce,
-            hash,
-            leadingZeros,
-            cred,
-          });
-          if (targetPubkey === currentIdentity.publicKeyPem) {
-            updateCredDisplay();
-          }
-          syncCredToServer(targetPubkey);
-          if (powStatusEl) {
-            powStatusEl.textContent = `Mined +${cred} cred (${proofs.length} proofs, ${hashes} hashes)`;
-          }
-          break;
-        }
-        nonce++;
-        if (nonce % 250 === 0) {
-          if (powStatusEl) {
-            powStatusEl.textContent = `Mining... (${hashes} hashes)`;
-          }
-          await new Promise((r) => setTimeout(r, 0));
-        }
-      }
-    }
+  let miningCred = false;
+  let sessionCred = currentIdentity.bestPow
+    ? scoreDigestCred(await sha256Bytes(`${currentIdentity.publicKeyPem}:${currentIdentity.bestPow.nonce}`))
+    : 0;
+
+  if (exportIdBtn) {
+    exportIdBtn.addEventListener('click', () => {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return;
+      const blob = new Blob([raw], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'pachytalk-identity.json';
+      a.click();
+      URL.revokeObjectURL(url);
+    });
   }
 
-  if (powBtn) {
-    powBtn.addEventListener('click', () => {
-      miningActive = !miningActive;
-      powBtn.textContent = miningActive ? 'Stop Proof-of-Work' : 'Start Proof-of-Work';
-      if (miningActive) {
-        if (powStatusEl) powStatusEl.textContent = 'Mining...';
-        runMiningLoop().catch((err) => {
-          miningActive = false;
-          powBtn.textContent = 'Start Proof-of-Work';
-          if (powStatusEl) {
-            powStatusEl.textContent = err instanceof Error ? err.message : 'Mining error';
-          }
-        });
-      } else if (powStatusEl) {
-        powStatusEl.textContent = 'Stopped';
+  if (importIdBtn && importIdFile) {
+    importIdBtn.addEventListener('click', () => importIdFile.click());
+    importIdFile.addEventListener('change', async () => {
+      const file = importIdFile.files?.[0];
+      importIdFile.value = '';
+      if (!file) return;
+      try {
+        miningCred = false;
+        if (mineCredBtn) mineCredBtn.textContent = 'Mine Cred';
+        const imported = await importIdentityFromJson(await file.text());
+        currentIdentity = imported;
+        await updateIdentityDisplay(currentIdentity.publicKeyPem);
+        sessionCred = 0;
+        if (imported.bestPow) {
+          const sig = await signText(imported.publicKeyPem, imported.privateKey);
+          const json = await submitCredProof(imported.publicKeyPem, sig, imported.bestPow.nonce);
+          sessionCred = Number(json.cred ?? 0);
+          updateDomCredForPubkey(imported.publicKeyPem, sessionCred);
+        }
+        if (mineStatusEl) {
+          mineStatusEl.textContent = sessionCred > 0 ? `Imported ID (cred: ${sessionCred})` : 'Imported ID';
+        }
+      } catch (err) {
+        alert(err instanceof Error ? err.message : 'Failed to import identity');
       }
     });
   }
@@ -258,21 +295,115 @@ async function init() {
     newIdBtn.addEventListener('click', async () => {
       newIdBtn.disabled = true;
       try {
+        miningCred = false;
+        sessionCred = 0;
+        if (mineCredBtn) mineCredBtn.textContent = 'Mine Cred';
+        if (mineStatusEl) mineStatusEl.textContent = '';
         currentIdentity = await generateAndStoreKeyPair();
-        if (pubkeyEl) {
-          pubkeyEl.textContent = currentIdentity.publicKeyPem;
-        }
-        updateCredDisplay();
+        await updateIdentityDisplay(currentIdentity.publicKeyPem);
       } finally {
         newIdBtn.disabled = false;
       }
     });
   }
 
+  const updateDomCredForPubkey = (pubkey, newCred) => {
+    if (newCred <= 0) return;
+    for (const card of document.querySelectorAll('.message-card')) {
+      if (card.getAttribute('data-pubkey') !== pubkey) continue;
+      const header = card.querySelector('.message-header');
+      if (!header) continue;
+      let credBadge = header.querySelector('.message-cred');
+      if (!credBadge) {
+        credBadge = document.createElement('span');
+        credBadge.className = 'message-cred';
+        credBadge.title = 'Cred is verifiable proof-of-work mined for this public key.';
+        header.appendChild(credBadge);
+      }
+      credBadge.innerHTML = `Cred: <strong>${newCred}</strong>`;
+    }
+  };
+
+  const submitCredProof = async (pubkey, sig, proofNonce) => {
+    const res = await fetch('/api/cred', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pubkey, sig, pow: { nonce: proofNonce } }),
+    });
+    const json = await res.json();
+    if (!res.ok) {
+      throw new Error(json.error || 'Failed to submit cred');
+    }
+    return json;
+  };
+
+  if (mineCredBtn) {
+    mineCredBtn.addEventListener('click', async () => {
+      if (miningCred) {
+        miningCred = false;
+        return;
+      }
+      miningCred = true;
+      mineCredBtn.textContent = 'Stop Mining';
+      if (mineStatusEl) {
+        mineStatusEl.textContent = sessionCred > 0 ? `Cred: ${sessionCred} (mining...)` : 'Mining...';
+      }
+      const pubkey = currentIdentity.publicKeyPem;
+      const rand = new Uint32Array(1);
+      window.crypto.getRandomValues(rand);
+      let nonce = rand[0] * 1000000;
+      let hashes = 0;
+      try {
+        const sig = await signText(pubkey, currentIdentity.privateKey);
+        if (currentIdentity.bestPow && Number.isInteger(currentIdentity.bestPow.nonce)) {
+          const json = await submitCredProof(pubkey, sig, currentIdentity.bestPow.nonce);
+          sessionCred = Number(json.cred ?? sessionCred);
+          updateDomCredForPubkey(pubkey, sessionCred);
+          if (mineStatusEl && sessionCred > 0) {
+            mineStatusEl.textContent = `Cred: ${sessionCred} (mining...)`;
+          }
+        }
+        while (miningCred && pubkey === currentIdentity.publicKeyPem) {
+          const digest = await sha256Bytes(`${pubkey}:${nonce}`);
+          const cred = scoreDigestCred(digest);
+          if (cred > sessionCred) {
+            const json = await submitCredProof(pubkey, sig, nonce);
+            sessionCred = Number(json.cred ?? cred);
+            currentIdentity.bestPow = { nonce };
+            saveBestPowToIdentity(pubkey, currentIdentity.bestPow);
+            updateDomCredForPubkey(pubkey, sessionCred);
+            if (mineStatusEl) {
+              mineStatusEl.textContent = `Cred: ${sessionCred} (${hashes} hashes)`;
+            }
+          }
+          nonce++;
+          hashes++;
+          if (hashes % 250 === 0) {
+            if (mineStatusEl) {
+              mineStatusEl.textContent = sessionCred > 0
+                ? `Cred: ${sessionCred} (${hashes} hashes)`
+                : `Mining (${hashes} hashes)...`;
+            }
+            await new Promise((r) => setTimeout(r, 0));
+          }
+        }
+        mineCredBtn.textContent = 'Mine Cred';
+        if (mineStatusEl) {
+          mineStatusEl.textContent = sessionCred > 0 ? `Cred: ${sessionCred}` : '';
+        }
+      } catch (err) {
+        miningCred = false;
+        mineCredBtn.textContent = 'Mine Cred';
+        alert(err instanceof Error ? err.message : 'Mining failed');
+        if (mineStatusEl) mineStatusEl.textContent = '';
+      }
+    });
+  }
+
   for (const form of document.querySelectorAll('.message-form')) {
+    const submitBtn = form.querySelector('button[type="submit"]');
     form.addEventListener('submit', async (event) => {
       event.preventDefault();
-      const submitBtn = form.querySelector('button[type="submit"]');
       const formData = new FormData(form);
       const data = String(formData.get('data') || '').trim();
       const path = String(formData.get('path') || '/default');
@@ -287,6 +418,7 @@ async function init() {
       if (submitBtn) submitBtn.disabled = true;
       try {
         let imageCid = null;
+        let mediaType = null;
         if (hasFile) {
           const uploadBody = new FormData();
           uploadBody.append('image', file);
@@ -296,12 +428,24 @@ async function init() {
           });
           const uploadJson = await uploadRes.json();
           if (!uploadRes.ok || !uploadJson.cid) {
-            throw new Error(uploadJson.error || 'Image upload failed');
+            throw new Error(uploadJson.error || 'Media upload failed');
           }
           imageCid = uploadJson.cid;
+          mediaType = uploadJson.media_type || (
+            file.type.startsWith('video/')
+              ? 'video'
+              : file.type.startsWith('audio/')
+                ? 'audio'
+                : file.type.startsWith('image/')
+                  ? 'image'
+                  : 'file'
+          );
         }
 
-        const payloadToSign = data || imageCid || '';
+        const payloadToSign = JSON.stringify({
+          data: data || '',
+          content_cid: imageCid || null,
+        });
         const sig = await signText(payloadToSign, currentIdentity.privateKey);
 
         const sendRes = await fetch('/api/send', {
@@ -312,7 +456,8 @@ async function init() {
             data,
             pubkey: currentIdentity.publicKeyPem,
             sig,
-            image_cid: imageCid,
+            content_cid: imageCid,
+            media_type: mediaType,
           }),
         });
         const sendJson = await sendRes.json();
@@ -323,7 +468,10 @@ async function init() {
         window.location.href = '/?board=' + encodeURIComponent(board);
       } catch (err) {
         alert(err instanceof Error ? err.message : 'Failed to send message');
-        if (submitBtn) submitBtn.disabled = false;
+        if (submitBtn) {
+          submitBtn.disabled = false;
+          submitBtn.textContent = 'Send';
+        }
       }
     });
   }
