@@ -170,7 +170,29 @@ async function init() {
       credEl.textContent = String(sumProofCred(getLocalProofs(currentIdentity.publicKeyPem)));
     }
   };
+  const syncCredToServer = async (pubkey) => {
+    const proofs = getLocalProofs(pubkey).map(({ timestamp, nonce }) => ({
+      timestamp,
+      nonce,
+    }));
+    if (proofs.length === 0) return;
+    try {
+      const res = await fetch('/api/pow/verify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pubkey, proofs }),
+      });
+      if (!res.ok) return;
+      const json = await res.json();
+      if (pubkey === currentIdentity.publicKeyPem && credEl && typeof json.cred === 'number') {
+        credEl.textContent = String(json.cred);
+      }
+    } catch {
+      // Keep local display if server sync fails
+    }
+  };
   updateCredDisplay();
+  syncCredToServer(currentIdentity.publicKeyPem);
 
   let miningActive = false;
 
@@ -196,6 +218,7 @@ async function init() {
           if (targetPubkey === currentIdentity.publicKeyPem) {
             updateCredDisplay();
           }
+          syncCredToServer(targetPubkey);
           if (powStatusEl) {
             powStatusEl.textContent = `Mined +${cred} cred (${proofs.length} proofs, ${hashes} hashes)`;
           }
@@ -280,27 +303,6 @@ async function init() {
 
         const payloadToSign = data || imageCid || '';
         const sig = await signText(payloadToSign, currentIdentity.privateKey);
-        const localProofs = getLocalProofs(currentIdentity.publicKeyPem).map(({ timestamp, nonce }) => ({
-          timestamp,
-          nonce,
-        }));
-
-        let powCid = null;
-        if (localProofs.length > 0) {
-          const powRes = await fetch('/api/pow/upload', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              pubkey: currentIdentity.publicKeyPem,
-              proofs: localProofs,
-            }),
-          });
-          const powJson = await powRes.json();
-          if (!powRes.ok) {
-            throw new Error(powJson.error || 'Failed to upload PoW proofs');
-          }
-          powCid = powJson.pow_cid || null;
-        }
 
         const sendRes = await fetch('/api/send', {
           method: 'POST',
@@ -311,7 +313,6 @@ async function init() {
             pubkey: currentIdentity.publicKeyPem,
             sig,
             image_cid: imageCid,
-            pow_cid: powCid,
           }),
         });
         const sendJson = await sendRes.json();
