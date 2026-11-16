@@ -23,7 +23,9 @@ import {
     bootstrapFromPeer,
     createBootstrapRouter,
     getConfiguredPeers,
+    getKnownPeers,
     pushMessageToPeers,
+    startPeerDiscovery,
     startPeerSync,
 } from './bootstrap.ts';
 
@@ -540,7 +542,7 @@ apiRouter.post('/send', async (req, res) => {
             media_type: mediaType,
         };
         await saveMessage(newMessage);
-        void pushMessageToPeers(newMessage, getConfiguredPeers(), getSelfUrl());
+        void pushMessageToPeers(newMessage, getKnownPeers(getSelfUrl()), getSelfUrl());
         return res.json({ ok: true, id, content_cid: contentCid, media_type: mediaType });
     }
     catch(e) {
@@ -581,6 +583,7 @@ function getSelfUrl(): string {
 
 const bootstrapDeps = {
     sanitizeBoard,
+    listBoardsFromDisk,
     getPubkeyHash,
     readMessageLog,
     getCredIndex,
@@ -684,14 +687,18 @@ if (sslKeyPath && sslCertPath) {
   });
 }
 
-const configuredPeers = getConfiguredPeers();
-if (process.env.BOOTSTRAP_URL) {
-  bootstrapFromPeer(process.env.BOOTSTRAP_URL, bootstrapDeps).catch((err) => {
-    console.error('Bootstrap error:', err);
+for (const peer of getConfiguredPeers()) {
+  bootstrapFromPeer(peer, bootstrapDeps).catch((err) => {
+    console.error(`Bootstrap error from ${peer}:`, err);
   });
 }
 const syncIntervalMs = process.env.SYNC_INTERVAL_MS !== undefined ? Number(process.env.SYNC_INTERVAL_MS) : 30000;
-startPeerSync(configuredPeers, bootstrapDeps, syncIntervalMs);
+startPeerSync(() => getKnownPeers(getSelfUrl()), bootstrapDeps, syncIntervalMs);
+
+const discoveryIntervalMs = process.env.DISCOVERY_INTERVAL_MS !== undefined ? Number(process.env.DISCOVERY_INTERVAL_MS) : 60000;
+startPeerDiscovery(bootstrapDeps, { getSelfUrl, intervalMs: discoveryIntervalMs }).catch((err) => {
+  console.error('Peer discovery error:', err);
+});
 
 // BitTorrent DHT removed; peer discovery handled by Helia/libp2p
 try {

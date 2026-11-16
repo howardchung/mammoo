@@ -9,23 +9,34 @@ Typecheck & Dev
 * `npm run dev` — run with `node --watch index.ts`
 * `npm run typecheck` — run `tsc --noEmit`
 
-Bootstrapping Another Instance
+Bootstrapping & Automatic Peer Discovery
 ====
-Each server stores post JSON in per-board JSONL log files (`${IPFS_DATA_DIR}/logs/<board>.log`), stores uploaded binary/media attachments (`content_cid`) in an embedded Helia IPFS node, and exposes `GET /api/bootstrap` returning `{ peerId, board, creds, multiaddrs, offset, count, messages }` (or NDJSON with `?format=ndjson`, with optional `?board=`, `?offset=`, and `?since=` filters).
+Each server stores post JSON in per-board JSONL log files (`${IPFS_DATA_DIR}/logs/<board>.log`), stores uploaded binary/media attachments (`content_cid`) in an embedded Helia IPFS node, and exposes `GET /api/bootstrap` returning `{ peerId, board, peers, creds, multiaddrs, offset, count, messages }` (or NDJSON with `?format=ndjson`, with optional `?board=`, `?offset=`, and `?since=` filters).
 
-To bootstrap a new instance from an existing seed server:
+Peers discover each other automatically via libp2p / IPFS DHT rendezvous:
 ```bash
-PORT=3141 IPFS_DATA_DIR=./ipfs-data BOOTSTRAP_URL=https://seed-host:3141 npm start
+PORT=3141 IPFS_DATA_DIR=./ipfs-data PUBLIC_URL=https://your-host:3141 npm start
 ```
-*(Optionally set `BOOTSTRAP_BOARD=<board>` to sync only a single board.)*
+*(Optionally set `BOOTSTRAP_BOARD=<board>` to sync only a single board, `PEERS=https://peer1:3141,...` for static peers, or `RENDEZVOUS_KEY` to isolate a private cluster.)*
 
-On startup, the new instance:
-1. Fetches `/api/bootstrap` from `BOOTSTRAP_URL`.
-2. For each unseen message, verifies the client signature over `{ data, content_cid }`.
-3. If `content_cid` is present, downloads the attachment from `${BOOTSTRAP_URL}/ipfs/<content_cid>` and stores it in its local Helia IPFS node.
-4. Appends the verified message to its local per-board `.log` file and imports any proof-of-work `creds` nonces for known public keys.
+When a node starts:
+1. It advertises a deterministic rendezvous CID (`pachytalk-v1`) on the IPFS DHT (`helia.routing.provide`) and queries `helia.routing.findProviders`, while also listening for `peer:connect` (e.g. mDNS on LAN).
+2. Over `/pachytalk/peer/1.0.0`, nodes exchange their `PUBLIC_URL` and known peers.
+3. For each newly discovered peer, the node fetches `/api/bootstrap`, verifies each message's client signature over `{ data, content_cid }`, downloads and pins any `content_cid` attachment from `/ipfs/<content_cid>` into its local IPFS node, appends the messages to its local per-board `.log` files, and imports `creds` nonces.
+4. Ongoing updates propagate via push-on-send (`POST /api/receive`) and periodic delta polling (`?since=`).
 
 *(For self-signed or mismatched TLS certs in local testing, pass `NODE_TLS_REJECT_UNAUTHORIZED=0`.)*
+
+Ports
+====
+* **Inbound:**
+  * **TCP `3141`** (or `PORT` env var) — HTTP/HTTPS server for the web UI, `/api/*` endpoints, and `/ipfs/:cid`.
+  * **Ephemeral TCP/WebSocket** — Embedded Helia `libp2p` listeners for P2P connections and `/pachytalk/peer/1.0.0` handshakes (plus **UDP `5353`** on LAN for mDNS).
+* **Outbound:**
+  * **Peer HTTP/HTTPS ports** (e.g. `3141`, `443`) — Peer sync (`/api/bootstrap`, `/api/receive`, `/ipfs/:cid`).
+  * **IPFS / libp2p peers** (typically TCP/UDP `4001` and advertised peer ports) — DHT rendezvous and Bitswap.
+  * **UDP `19302`** — Outbound STUN lookup to `stun.l.google.com:19302` when `DOMAIN` is not set.
+  * **TCP `443`** — Outbound HTTPS stream for the Mastodon firehose.
 
 TODO
 ====

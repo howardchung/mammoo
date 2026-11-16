@@ -114,6 +114,7 @@ function buildThreadTree(messages: ForumMessage[]): ThreadNode[] {
       roots.push(node);
     }
   }
+  roots.sort((a, b) => b.message.id.localeCompare(a.message.id));
   return roots;
 }
 
@@ -204,7 +205,7 @@ function renderForumPage({ board, messages, replyTo, ipfsGatewayUrl, powDifficul
   const tree = buildThreadTree(messages);
   const renderedMessages = tree.length
     ? tree.map((node) => renderMessage(node, board, replyTo, ipfsGatewayUrl)).join('\n')
-    : '<p class="empty-state">No messages yet. Start a new topic below!</p>';
+    : '<p class="empty-state">No messages yet. Start a new topic above!</p>';
 
   return `<!doctype html>
 <html lang="en">
@@ -212,6 +213,7 @@ function renderForumPage({ board, messages, replyTo, ipfsGatewayUrl, powDifficul
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
     <title>pachytalk</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg">
     <link rel="stylesheet" href="/style.css">
     <script src="/client.js" defer></script>
   </head>
@@ -237,9 +239,6 @@ function renderForumPage({ board, messages, replyTo, ipfsGatewayUrl, powDifficul
           <pre class="pubkey" id="client-pubkey">Generating client keypair...</pre>
         </details>
       </header>
-      <main class="messages-container">
-        ${renderedMessages}
-      </main>
       <form method="POST" action="/api/send" enctype="multipart/form-data" class="message-form new-topic-form">
         <input type="hidden" name="path" value="/${safeBoard}">
         <input type="hidden" name="board" value="${safeBoard}">
@@ -249,6 +248,9 @@ function renderForumPage({ board, messages, replyTo, ipfsGatewayUrl, powDifficul
           <button type="submit">Send</button>
         </div>
       </form>
+      <main class="messages-container">
+        ${renderedMessages}
+      </main>
     </div>
   </body>
 </html>
