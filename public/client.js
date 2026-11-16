@@ -105,13 +105,113 @@ async function sendActivityPub(acct, message, follower) {
 
 window.pachytalkSendActivityPub = sendActivityPub;
 
+async function sha256Hex(input) {
+  const encoded = new TextEncoder().encode(input);
+  const digest = await window.crypto.subtle.digest('SHA-256', encoded);
+  return arrayBufferToHex(digest);
+}
+
+function countLeadingZeros(hex) {
+  let count = 0;
+  while (count < hex.length && hex[count] === '0') {
+    count++;
+  }
+  return count;
+}
+
+async function fetchCred(pubkey) {
+  const res = await fetch('/api/cred?pubkey=' + encodeURIComponent(pubkey));
+  if (!res.ok) return 0;
+  const json = await res.json();
+  return Number(json.cred || 0);
+}
+
 async function init() {
   const pubkeyEl = document.getElementById('client-pubkey');
   const newIdBtn = document.getElementById('new-id-btn');
+  const powBtn = document.getElementById('pow-btn');
+  const credEl = document.getElementById('cred-balance');
+  const powStatusEl = document.getElementById('pow-status');
 
   let currentIdentity = await getOrCreateKeyPair();
   if (pubkeyEl) {
     pubkeyEl.textContent = currentIdentity.publicKeyPem;
+  }
+  if (credEl) {
+    credEl.textContent = String(await fetchCred(currentIdentity.publicKeyPem));
+  }
+
+  let miningActive = false;
+
+  async function runMiningLoop() {
+    let hashes = 0;
+    while (miningActive) {
+      const targetPubkey = currentIdentity.publicKeyPem;
+      const challengeRes = await fetch('/api/pow/challenge', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pubkey: targetPubkey }),
+      });
+      const challengeJson = await challengeRes.json();
+      if (!challengeRes.ok || !challengeJson.challenge) {
+        throw new Error(challengeJson.error || 'Failed to get PoW challenge');
+      }
+
+      const { challenge, difficulty } = challengeJson;
+      let nonce = 0;
+      while (miningActive && targetPubkey === currentIdentity.publicKeyPem) {
+        const hash = await sha256Hex(`${challenge}:${nonce}`);
+        hashes++;
+        if (countLeadingZeros(hash) >= difficulty) {
+          const submitRes = await fetch('/api/pow/submit', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              challenge,
+              nonce: String(nonce),
+              pubkey: targetPubkey,
+            }),
+          });
+          const submitJson = await submitRes.json();
+          if (!submitRes.ok) {
+            throw new Error(submitJson.error || 'PoW verification failed');
+          }
+          if (credEl && targetPubkey === currentIdentity.publicKeyPem) {
+            credEl.textContent = String(submitJson.cred);
+          }
+          if (powStatusEl) {
+            powStatusEl.textContent = `Verified (+${submitJson.awarded} cred, ${hashes} hashes)`;
+          }
+          break;
+        }
+        nonce++;
+        if (nonce % 250 === 0) {
+          if (powStatusEl) {
+            powStatusEl.textContent = `Mining... (${hashes} hashes)`;
+          }
+          await new Promise((r) => setTimeout(r, 0));
+        }
+      }
+    }
+  }
+
+  if (powBtn) {
+    powBtn.addEventListener('click', () => {
+      miningActive = !miningActive;
+      powBtn.textContent = miningActive ? 'Stop Proof-of-Work' : 'Start Proof-of-Work';
+      if (miningActive) {
+        if (powStatusEl) powStatusEl.textContent = 'Mining...';
+        runMiningLoop().catch((err) => {
+          miningActive = false;
+          powBtn.textContent = 'Start Proof-of-Work';
+          if (powStatusEl) {
+            powStatusEl.textContent = err instanceof Error ? err.message : 'Mining error';
+          }
+        });
+      } else if (powStatusEl) {
+        powStatusEl.textContent = 'Stopped';
+      }
+    });
   }
 
   if (newIdBtn) {
@@ -121,6 +221,9 @@ async function init() {
         currentIdentity = await generateAndStoreKeyPair();
         if (pubkeyEl) {
           pubkeyEl.textContent = currentIdentity.publicKeyPem;
+        }
+        if (credEl) {
+          credEl.textContent = String(await fetchCred(currentIdentity.publicKeyPem));
         }
       } finally {
         newIdBtn.disabled = false;

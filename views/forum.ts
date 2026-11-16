@@ -80,8 +80,11 @@ function renderForumPage({ board, messages, replyTo, ipfsGatewayUrl }: ForumPage
     <div class="app">
       <header class="app-header">
         <h2>You're on board ${safeBoard}</h2>
-        <div>
+        <div class="header-actions">
           <button type="button" id="new-id-btn">Create New ID</button>
+          <button type="button" id="pow-btn">Start Proof-of-Work</button>
+          <span class="cred-badge">Cred: <strong id="cred-balance">0</strong></span>
+          <span id="pow-status" class="pow-status">Idle</span>
         </div>
         <h3>You're posting as</h3>
         <pre class="pubkey" id="client-pubkey">Generating client keypair...</pre>

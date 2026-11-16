@@ -80,6 +80,27 @@ body {
   background: rgba(255, 255, 255, 0.2);
 }
 
+.header-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.cred-badge {
+  padding: 6px 12px;
+  border-radius: 999px;
+  background: rgba(37, 99, 235, 0.25);
+  border: 1px solid rgba(96, 165, 250, 0.4);
+  font-size: 0.86rem;
+  color: #e2e8f0;
+}
+
+.pow-status {
+  font-size: 0.82rem;
+  color: var(--header-muted);
+}
+
 .pubkey {
   margin: 0;
   padding: 10px 12px;

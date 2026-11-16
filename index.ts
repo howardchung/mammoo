@@ -44,6 +44,49 @@ const IPFS_GATEWAY_URL = (process.env.IPFS_GATEWAY_URL || '/ipfs').replace(/\/+$
 const IPFS_DATA_DIR = path.resolve(process.env.IPFS_DATA_DIR || path.join(__dirname, 'ipfs-data'));
 const app = express();
 const db = new DatabaseSync(path.join(__dirname, 'database.sqlite'));
+db.exec(`
+    CREATE TABLE IF NOT EXISTS cred (
+        pubkey TEXT PRIMARY KEY,
+        balance INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL
+    );
+`);
+
+const POW_DIFFICULTY = Number(process.env.POW_DIFFICULTY) || 4;
+const POW_TTL_MS = 5 * 60 * 1000;
+
+interface PowChallenge {
+    pubkey: string;
+    difficulty: number;
+    expiresAt: number;
+}
+
+const activePowChallenges = new Map<string, PowChallenge>();
+
+function countLeadingHexZeros(hex: string): number {
+    let count = 0;
+    while (count < hex.length && hex[count] === '0') {
+        count++;
+    }
+    return count;
+}
+
+function getCredBalance(pubkey: string): number {
+    const row = db.prepare('SELECT balance FROM cred WHERE pubkey = ?').get(pubkey) as { balance: number } | undefined;
+    return row ? row.balance : 0;
+}
+
+function awardCred(pubkey: string, amount: number): number {
+    const now = new Date().toISOString();
+    db.prepare(`
+        INSERT INTO cred (pubkey, balance, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(pubkey) DO UPDATE SET
+            balance = balance + excluded.balance,
+            updated_at = excluded.updated_at
+    `).run(pubkey, amount, now);
+    return getCredBalance(pubkey);
+}
 
 const upload = multer({
     storage: multer.memoryStorage(),
@@ -309,6 +352,77 @@ apiRouter.get('/bootstrap', async (_req, res) => {
         console.error(e);
         res.status(500).json({ error: (e as Error).message });
     }
+});
+
+apiRouter.get('/cred', (req, res) => {
+    const pubkey = String(req.query.pubkey || '');
+    if (!pubkey) {
+        return res.status(400).json({ error: 'pubkey query parameter is required' });
+    }
+    return res.json({ cred: getCredBalance(pubkey) });
+});
+
+apiRouter.post('/pow/challenge', (req, res) => {
+    const body = req.body || {};
+    const pubkey = String(body.pubkey || '');
+    if (!pubkey) {
+        return res.status(400).json({ error: 'pubkey is required' });
+    }
+    const now = Date.now();
+    for (const [id, entry] of activePowChallenges.entries()) {
+        if (entry.expiresAt <= now) {
+            activePowChallenges.delete(id);
+        }
+    }
+    const challenge = crypto.randomBytes(16).toString('hex');
+    activePowChallenges.set(challenge, {
+        pubkey,
+        difficulty: POW_DIFFICULTY,
+        expiresAt: now + POW_TTL_MS,
+    });
+    return res.json({
+        challenge,
+        difficulty: POW_DIFFICULTY,
+    });
+});
+
+apiRouter.post('/pow/submit', (req, res) => {
+    const body = req.body || {};
+    const challenge = String(body.challenge || '');
+    const nonce = body.nonce == null ? '' : String(body.nonce);
+    const pubkey = String(body.pubkey || '');
+    if (!challenge || nonce === '' || !pubkey) {
+        return res.status(400).json({ error: 'challenge, nonce, and pubkey are required' });
+    }
+
+    const entry = activePowChallenges.get(challenge);
+    if (!entry) {
+        return res.status(400).json({ error: 'Unknown or already used challenge' });
+    }
+    activePowChallenges.delete(challenge);
+
+    if (entry.expiresAt <= Date.now()) {
+        return res.status(400).json({ error: 'Challenge expired' });
+    }
+    if (entry.pubkey !== pubkey) {
+        return res.status(400).json({ error: 'Challenge does not match pubkey' });
+    }
+
+    const hash = crypto.createHash('sha256').update(`${challenge}:${nonce}`).digest('hex');
+    const leadingZeros = countLeadingHexZeros(hash);
+    if (leadingZeros < entry.difficulty) {
+        return res.status(400).json({ error: `Insufficient work: ${leadingZeros} leading zeros (need ${entry.difficulty})` });
+    }
+
+    const awarded = Math.pow(2, leadingZeros - entry.difficulty);
+    const cred = awardCred(pubkey, awarded);
+    return res.json({
+        ok: true,
+        hash,
+        leadingZeros,
+        awarded,
+        cred,
+    });
 });
 
 const PORT = Number(process.env.PORT) || 3141;
