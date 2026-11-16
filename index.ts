@@ -19,7 +19,13 @@ import { buildMessageSignaturePayload, renderForumPage } from './views/forum.ts'
 import type { ForumMessage, PowProof } from './views/forum.ts';
 import startFirehose from './firehose.ts';
 import { createActivityPubRouter } from './activitypub.ts';
-import { bootstrapFromPeer, createBootstrapRouter } from './bootstrap.ts';
+import {
+    bootstrapFromPeer,
+    createBootstrapRouter,
+    getConfiguredPeers,
+    pushMessageToPeers,
+    startPeerSync,
+} from './bootstrap.ts';
 
 interface MessageRow extends ForumMessage {
     id: string;
@@ -267,14 +273,7 @@ function getBoardLogState(board: string): Promise<BoardLogState> {
                 for (const rawLine of raw.split('\n')) {
                     const line = rawLine.trim();
                     if (!line) continue;
-                    let msg: MessageRow | null = null;
-                    if (line.startsWith('{')) {
-                        msg = JSON.parse(line) as MessageRow;
-                    } else {
-                        // Backwards-compatible fallback for legacy CID-only log lines
-                        const buf = await readBytesFromIpfs(line);
-                        msg = { ...(JSON.parse(buf.toString('utf8')) as MessageRow), cid: line };
-                    }
+                    const msg = JSON.parse(line) as MessageRow;
                     if (msg && msg.id && !ids.has(msg.id)) {
                         ids.add(msg.id);
                         messages.push(msg);
@@ -358,6 +357,11 @@ async function readMessageLog(board?: string, offset: number = 0, since?: string
     withCred.sort((a, b) => a.id.localeCompare(b.id));
     const filtered = filterBySince(withCred, since);
     return offset > 0 ? filtered.slice(offset) : filtered;
+}
+
+async function hasMessageId(id: string): Promise<boolean> {
+    const state = await getBoardLogState(getBoardFromId(id));
+    return state.ids.has(id);
 }
 
 async function saveMessage(message: MessageRow): Promise<boolean> {
@@ -526,7 +530,7 @@ apiRouter.post('/send', async (req, res) => {
         const mediaType = validMediaTypes.has(json.media_type)
             ? json.media_type
             : (contentCid ? 'image' : null);
-        await saveMessage({
+        const newMessage: MessageRow = {
             id,
             depth,
             data,
@@ -534,14 +538,15 @@ apiRouter.post('/send', async (req, res) => {
             sig,
             content_cid: contentCid,
             media_type: mediaType,
-        });
+        };
+        await saveMessage(newMessage);
+        void pushMessageToPeers(newMessage, getConfiguredPeers(), getSelfUrl());
         return res.json({ ok: true, id, content_cid: contentCid, media_type: mediaType });
     }
     catch(e) {
         console.error(e);
         return res.status(500).json({ error: (e as Error).message });
     }
-    // TODO forward these messages to our peers
 });
 
 apiRouter.post('/cred', async (req, res) => {
@@ -563,6 +568,17 @@ apiRouter.post('/cred', async (req, res) => {
     }
 });
 
+const PORT = Number(process.env.PORT) || 3141;
+let domain = process.env.DOMAIN || '';
+
+function getSelfUrl(): string {
+    if (process.env.PUBLIC_URL) {
+        return process.env.PUBLIC_URL.replace(/\/+$/, '');
+    }
+    const scheme = process.env.SSL_KEY_PATH && process.env.SSL_CERT_PATH ? 'https' : 'http';
+    return `${scheme}://${domain || 'localhost'}:${PORT}`;
+}
+
 const bootstrapDeps = {
     sanitizeBoard,
     getPubkeyHash,
@@ -571,14 +587,12 @@ const bootstrapDeps = {
     upsertPubkeyCred,
     uploadToIpfs,
     verifySignature,
+    hasMessageId,
     saveMessage,
     getIpfs,
 };
 
-apiRouter.use(createBootstrapRouter(bootstrapDeps));
-
-const PORT = Number(process.env.PORT) || 3141;
-let domain = process.env.DOMAIN || '';
+apiRouter.use(createBootstrapRouter(bootstrapDeps, { getSelfUrl }));
 
 /**
  * Queries a STUN server (RFC 5389 Binding Request) to discover our public IPv4 address.
@@ -670,11 +684,14 @@ if (sslKeyPath && sslCertPath) {
   });
 }
 
+const configuredPeers = getConfiguredPeers();
 if (process.env.BOOTSTRAP_URL) {
   bootstrapFromPeer(process.env.BOOTSTRAP_URL, bootstrapDeps).catch((err) => {
     console.error('Bootstrap error:', err);
   });
 }
+const syncIntervalMs = process.env.SYNC_INTERVAL_MS !== undefined ? Number(process.env.SYNC_INTERVAL_MS) : 30000;
+startPeerSync(configuredPeers, bootstrapDeps, syncIntervalMs);
 
 // BitTorrent DHT removed; peer discovery handled by Helia/libp2p
 try {

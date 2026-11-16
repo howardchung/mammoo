@@ -26,6 +26,7 @@ export interface BootstrapDeps {
   ) => Promise<{ ok: boolean; cred: number; updated: boolean }>;
   uploadToIpfs: (buffer: Buffer) => Promise<string>;
   verifySignature: (data: unknown, pubkey: unknown, sig: unknown) => boolean;
+  hasMessageId: (id: string) => Promise<boolean>;
   saveMessage: (message: BootstrapMessageRow) => Promise<boolean>;
   getIpfs: () => Promise<{
     helia: {
@@ -37,8 +38,111 @@ export interface BootstrapDeps {
   }>;
 }
 
-export function createBootstrapRouter(deps: BootstrapDeps): Router {
+export function getConfiguredPeers(): string[] {
+  const raw = [process.env.PEERS || '', process.env.BOOTSTRAP_URL || ''].join(',');
+  const seen = new Set<string>();
+  for (const entry of raw.split(',')) {
+    const cleaned = entry.trim().replace(/\/+$/, '');
+    if (cleaned) {
+      seen.add(cleaned);
+    }
+  }
+  return Array.from(seen);
+}
+
+async function pinAssetFromPeer(
+  baseUrl: string,
+  cidStr: string,
+  uploadToIpfs: (buffer: Buffer) => Promise<string>
+): Promise<void> {
+  const assetRes = await fetch(`${baseUrl}/ipfs/${encodeURIComponent(cidStr)}`, {
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!assetRes.ok) return;
+  const buf = Buffer.from(await assetRes.arrayBuffer());
+  await uploadToIpfs(buf);
+}
+
+export async function pushMessageToPeers(
+  message: BootstrapMessageRow,
+  peers: string[],
+  sourceUrl?: string
+): Promise<void> {
+  const normalizedSource = sourceUrl ? sourceUrl.replace(/\/+$/, '') : undefined;
+  const targets = peers.filter((peer) => peer !== normalizedSource);
+  if (targets.length === 0) return;
+
+  await Promise.allSettled(
+    targets.map(async (peer) => {
+      try {
+        const res = await fetch(`${peer}/api/receive`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message, sourceUrl: normalizedSource }),
+          signal: AbortSignal.timeout(5000),
+        });
+        if (!res.ok) {
+          console.warn(`Peer push to ${peer} failed (${res.status})`);
+        }
+      } catch (err) {
+        console.warn(`Peer push to ${peer} error:`, (err as Error).message);
+      }
+    })
+  );
+}
+
+export function createBootstrapRouter(
+  deps: BootstrapDeps,
+  options?: { getSelfUrl?: () => string }
+): Router {
   const router = express.Router();
+
+  router.post('/receive', async (req, res) => {
+    try {
+      const body = req.body || {};
+      const msg = (body.message || body) as BootstrapMessageRow;
+      const sourceUrl = typeof body.sourceUrl === 'string' ? body.sourceUrl.replace(/\/+$/, '') : undefined;
+
+      if (!msg || typeof msg.id !== 'string' || !msg.id) {
+        return res.status(400).json({ error: 'Invalid message payload' });
+      }
+      if (!msg.data && !msg.content_cid) {
+        return res.status(400).json({ error: 'Message data or content_cid is required' });
+      }
+
+      const signedPayload = buildMessageSignaturePayload(msg.data, msg.content_cid);
+      if (!deps.verifySignature(signedPayload, msg.pubkey, msg.sig)) {
+        return res.status(400).json({ error: 'Invalid signature' });
+      }
+
+      if (await deps.hasMessageId(msg.id)) {
+        return res.json({ ok: true, imported: false });
+      }
+
+      if (msg.content_cid && sourceUrl) {
+        await pinAssetFromPeer(sourceUrl, msg.content_cid, deps.uploadToIpfs);
+      }
+
+      const cleanMessage: BootstrapMessageRow = {
+        id: msg.id,
+        depth: msg.depth,
+        data: msg.data,
+        pubkey: msg.pubkey,
+        sig: msg.sig,
+        content_cid: msg.content_cid ?? null,
+        ...(msg.media_type ? { media_type: msg.media_type } : {}),
+      };
+      const saved = await deps.saveMessage(cleanMessage);
+      if (saved) {
+        const selfUrl = options?.getSelfUrl?.();
+        void pushMessageToPeers(cleanMessage, getConfiguredPeers(), sourceUrl || selfUrl);
+      }
+      return res.json({ ok: true, imported: saved });
+    } catch (e) {
+      console.error(e);
+      return res.status(500).json({ error: (e as Error).message });
+    }
+  });
 
   router.get('/bootstrap', async (req, res) => {
     try {
@@ -101,7 +205,11 @@ async function importPeerMessage(
   return saved;
 }
 
-export async function bootstrapFromPeer(bootstrapUrl: string, deps: BootstrapDeps): Promise<void> {
+export async function bootstrapFromPeer(
+  bootstrapUrl: string,
+  deps: BootstrapDeps,
+  options?: { quiet?: boolean; useSince?: boolean }
+): Promise<number> {
   const baseUrl = bootstrapUrl.replace(/\/+$/, '');
   const targetBoard = process.env.BOOTSTRAP_BOARD ? deps.sanitizeBoard(process.env.BOOTSTRAP_BOARD) : undefined;
   const existingMessages = await deps.readMessageLog(targetBoard);
@@ -111,8 +219,22 @@ export async function bootstrapFromPeer(bootstrapUrl: string, deps: BootstrapDep
   if (targetBoard) {
     params.set('board', targetBoard);
   }
+  if (options?.useSince && existingMessages.length > 0) {
+    let latestLeaf = '';
+    for (const msg of existingMessages) {
+      const leaf = msg.id.split('/').pop() || '';
+      if (leaf > latestLeaf) {
+        latestLeaf = leaf;
+      }
+    }
+    if (latestLeaf) {
+      params.set('since', latestLeaf);
+    }
+  }
   const qs = params.toString();
-  const res = await fetch(`${baseUrl}/api/bootstrap${qs ? `?${qs}` : ''}`);
+  const res = await fetch(`${baseUrl}/api/bootstrap${qs ? `?${qs}` : ''}`, {
+    signal: AbortSignal.timeout(15000),
+  });
   if (!res.ok) {
     throw new Error(`Bootstrap request failed (${res.status} ${res.statusText})`);
   }
@@ -138,12 +260,7 @@ export async function bootstrapFromPeer(bootstrapUrl: string, deps: BootstrapDep
     }
   };
 
-  const pinViaHttp = async (cidStr: string) => {
-    const assetRes = await fetch(`${baseUrl}/ipfs/${encodeURIComponent(cidStr)}`);
-    if (!assetRes.ok) return;
-    const buf = Buffer.from(await assetRes.arrayBuffer());
-    await deps.uploadToIpfs(buf);
-  };
+  const pinViaHttp = (cidStr: string) => pinAssetFromPeer(baseUrl, cidStr, deps.uploadToIpfs);
 
   if (Array.isArray(info.messages) && info.messages.length > 0) {
     let imported = 0;
@@ -153,10 +270,43 @@ export async function bootstrapFromPeer(bootstrapUrl: string, deps: BootstrapDep
       }
     }
     await applyBootstrappedCreds();
-    console.log(`Bootstrapped ${imported} message(s) from ${baseUrl}`);
-    return;
+    if (!options?.quiet || imported > 0) {
+      console.log(`Synced ${imported} message(s) from ${baseUrl}`);
+    }
+    return imported;
   }
 
   await applyBootstrappedCreds();
-  console.log('Bootstrap peer has no new messages.');
+  if (!options?.quiet) {
+    console.log('Bootstrap peer has no new messages.');
+  }
+  return 0;
+}
+
+export function startPeerSync(
+  peers: string[],
+  deps: BootstrapDeps,
+  intervalMs: number = 30000
+): NodeJS.Timeout | null {
+  if (peers.length === 0 || intervalMs <= 0) {
+    return null;
+  }
+  let syncing = false;
+  const timer = setInterval(async () => {
+    if (syncing) return;
+    syncing = true;
+    try {
+      for (const peer of peers) {
+        try {
+          await bootstrapFromPeer(peer, deps, { quiet: true, useSince: true });
+        } catch (err) {
+          console.warn(`Peer sync from ${peer} failed:`, (err as Error).message);
+        }
+      }
+    } finally {
+      syncing = false;
+    }
+  }, intervalMs);
+  timer.unref?.();
+  return timer;
 }
