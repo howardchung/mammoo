@@ -148,12 +148,26 @@ async function sendActivityPub(acct, message, follower) {
 
 window.pachytalkSendActivityPub = sendActivityPub;
 
-const rawDifficultyBits = Number(document.querySelector('.app')?.getAttribute('data-pow-difficulty-bits'));
-const POW_DIFFICULTY_BITS = Number.isInteger(rawDifficultyBits) && rawDifficultyBits >= 1 && rawDifficultyBits <= 63
-  ? rawDifficultyBits
-  : 16;
-const POW_BASE_TARGET = 1n << BigInt(64 - POW_DIFFICULTY_BITS);
+const rawHashesPerSecond = Number(document.querySelector('.app')?.getAttribute('data-pow-hashes-per-second'));
+const POW_HASHES_PER_SECOND = Number.isInteger(rawHashesPerSecond) && rawHashesPerSecond >= 1
+  ? rawHashesPerSecond
+  : 100000;
+const POW_BASE_TARGET = (1n << 64n) / BigInt(POW_HASHES_PER_SECOND);
 const POW_CRED_SCALE = 1n;
+
+function formatCredMiningTime(cred) {
+  const seconds = cred;
+  if (seconds < 60) {
+    return `${seconds < 10 ? seconds.toFixed(1).replace(/\.0$/, '') : Math.round(seconds)}s`;
+  }
+  if (seconds < 3600) {
+    return `${(seconds / 60).toFixed(1).replace(/\.0$/, '')}m`;
+  }
+  if (seconds < 86400) {
+    return `${(seconds / 3600).toFixed(1).replace(/\.0$/, '')}h`;
+  }
+  return `${(seconds / 86400).toFixed(1).replace(/\.0$/, '')}d`;
+}
 
 async function sha256Bytes(input) {
   const encoded = new TextEncoder().encode(input);
@@ -309,6 +323,7 @@ async function init() {
 
   const updateDomCredForPubkey = (pubkey, newCred) => {
     if (newCred <= 0) return;
+    const estTime = formatCredMiningTime(newCred);
     for (const card of document.querySelectorAll('.message-card')) {
       if (card.getAttribute('data-pubkey') !== pubkey) continue;
       const header = card.querySelector('.message-header');
@@ -317,9 +332,9 @@ async function init() {
       if (!credBadge) {
         credBadge = document.createElement('span');
         credBadge.className = 'message-cred';
-        credBadge.title = 'Cred is verifiable proof-of-work mined for this public key.';
         header.appendChild(credBadge);
       }
+      credBadge.title = `Cred is verifiable proof-of-work mined for this public key (~${estTime} at 100k H/s).`;
       credBadge.innerHTML = `Cred: <strong>${newCred}</strong>`;
     }
   };
@@ -472,6 +487,15 @@ async function init() {
           submitBtn.disabled = false;
           submitBtn.textContent = 'Send';
         }
+      }
+    });
+  }
+
+  const boardSelect = document.getElementById('board-select');
+  if (boardSelect) {
+    boardSelect.addEventListener('change', () => {
+      if (boardSelect.form) {
+        boardSelect.form.submit();
       }
     });
   }

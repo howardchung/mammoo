@@ -1,6 +1,5 @@
-import fs from 'node:fs';
-import path from 'node:path';
 import crypto from 'node:crypto';
+import type { DatabaseSync } from 'node:sqlite';
 import express from 'express';
 import type { Request, Response, Router } from 'express';
 
@@ -89,7 +88,7 @@ async function resolveRemoteAuthor(
 export interface ActivityPubDeps {
   getDomain: (req?: Request) => string;
   getServerIdentity: () => Promise<ActivityPubIdentity>;
-  dataDir: string;
+  getDb: () => DatabaseSync;
   onIncomingNote?: (note: IncomingActivityPubNote) => Promise<void> | void;
 }
 
@@ -155,24 +154,19 @@ function getConfiguredInboxes(): string[] {
     .filter((u) => u.startsWith('http://') || u.startsWith('https://'));
 }
 
-async function loadFollowers(dataDir: string): Promise<Set<string>> {
-  const filePath = path.join(dataDir, 'activitypub-followers.json');
-  try {
-    const raw = await fs.promises.readFile(filePath, 'utf8');
-    const parsed = JSON.parse(raw) as unknown;
-    return new Set(Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === 'string') : []);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-      return new Set<string>();
-    }
-    throw err;
-  }
+function loadFollowers(db: DatabaseSync): string[] {
+  const rows = db
+    .prepare('SELECT inbox FROM activitypub_followers ORDER BY inbox ASC')
+    .all() as Array<{ inbox: string }>;
+  return rows.map((r) => r.inbox);
 }
 
-async function saveFollowers(dataDir: string, followers: Set<string>): Promise<void> {
-  const filePath = path.join(dataDir, 'activitypub-followers.json');
-  await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
-  await fs.promises.writeFile(filePath, JSON.stringify(Array.from(followers), null, 2), 'utf8');
+function addFollower(db: DatabaseSync, inbox: string): void {
+  db.prepare('INSERT OR IGNORE INTO activitypub_followers (inbox) VALUES (?)').run(inbox);
+}
+
+function removeFollower(db: DatabaseSync, inbox: string): void {
+  db.prepare('DELETE FROM activitypub_followers WHERE inbox = ?').run(inbox);
 }
 
 interface RelayRecord {
@@ -181,26 +175,22 @@ interface RelayRecord {
   followedAt: string;
 }
 
-async function loadRelays(dataDir: string): Promise<Record<string, RelayRecord>> {
-  const filePath = path.join(dataDir, 'activitypub-relays.json');
-  try {
-    const raw = await fs.promises.readFile(filePath, 'utf8');
-    const parsed = JSON.parse(raw) as unknown;
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-      ? (parsed as Record<string, RelayRecord>)
-      : {};
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-      return {};
-    }
-    throw err;
-  }
+function getRelay(db: DatabaseSync, actorUrl: string): RelayRecord | null {
+  const row = db
+    .prepare('SELECT inbox, status, followed_at FROM activitypub_relays WHERE actor_url = ?')
+    .get(actorUrl) as { inbox: string; status: 'pending' | 'accepted'; followed_at: string } | undefined;
+  return row ? { inbox: row.inbox, status: row.status, followedAt: row.followed_at } : null;
 }
 
-async function saveRelays(dataDir: string, relays: Record<string, RelayRecord>): Promise<void> {
-  const filePath = path.join(dataDir, 'activitypub-relays.json');
-  await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
-  await fs.promises.writeFile(filePath, JSON.stringify(relays, null, 2), 'utf8');
+function upsertRelay(db: DatabaseSync, actorUrl: string, record: RelayRecord): void {
+  db.prepare(
+    `INSERT INTO activitypub_relays (actor_url, inbox, status, followed_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(actor_url) DO UPDATE SET
+       inbox = excluded.inbox,
+       status = excluded.status,
+       followed_at = excluded.followed_at`
+  ).run(actorUrl, record.inbox, record.status, record.followedAt);
 }
 
 function isPublicHttpsDomain(origin: string): boolean {
@@ -231,12 +221,11 @@ export async function followRelays(deps: ActivityPubDeps): Promise<void> {
   const actorUrl = `${origin}/u/default`;
   const keyId = `${actorUrl}#main-key`;
   const identity = await deps.getServerIdentity();
-  const relays = await loadRelays(deps.dataDir);
-  let changed = false;
+  const db = deps.getDb();
 
   for (const rawRelayUrl of relayUrls) {
     const relayActorUrl = rawRelayUrl.replace(/\/+$/, '');
-    if (relays[relayActorUrl]) continue;
+    if (getRelay(db, relayActorUrl)) continue;
     try {
       let inbox = relayActorUrl.endsWith('/inbox') ? relayActorUrl : '';
       if (!inbox) {
@@ -268,21 +257,16 @@ export async function followRelays(deps: ActivityPubDeps): Promise<void> {
       };
       const status = await deliverSignedActivity(followActivity, keyId, identity.privateKeyPem, inbox);
       if (status >= 200 && status < 300) {
-        relays[relayActorUrl] = {
+        upsertRelay(db, relayActorUrl, {
           inbox,
           status: 'pending',
           followedAt: new Date().toISOString(),
-        };
-        changed = true;
+        });
         console.log(`Sent ActivityPub Follow to relay ${relayActorUrl} (${status})`);
       }
     } catch (err) {
       console.warn(`Failed to follow ActivityPub relay ${relayActorUrl}:`, (err as Error).message);
     }
-  }
-
-  if (changed) {
-    await saveRelays(deps.dataDir, relays);
   }
 }
 
@@ -372,7 +356,7 @@ export async function publishPostToFediverse(
   post: PublishablePost,
   deps: ActivityPubDeps
 ): Promise<void> {
-  const followers = await loadFollowers(deps.dataDir);
+  const followers = loadFollowers(deps.getDb());
   const targets = new Set<string>([...followers, ...getConfiguredInboxes()]);
   if (targets.size === 0) return;
 
@@ -556,9 +540,7 @@ export function createActivityPubRootRouter(deps: ActivityPubDeps): Router {
         if (body.type === 'Follow') {
           const inbox = await resolveActorInbox(body.actor);
           if (inbox) {
-            const followers = await loadFollowers(deps.dataDir);
-            followers.add(inbox);
-            await saveFollowers(deps.dataDir, followers);
+            addFollower(deps.getDb(), inbox);
             const identity = await deps.getServerIdentity();
             void deliverSignedActivity(
               {
@@ -579,21 +561,18 @@ export function createActivityPubRootRouter(deps: ActivityPubDeps): Router {
         if (body.type === 'Undo' && body.object?.type === 'Follow') {
           const inbox = await resolveActorInbox(body.actor);
           if (inbox) {
-            const followers = await loadFollowers(deps.dataDir);
-            if (followers.delete(inbox)) {
-              await saveFollowers(deps.dataDir, followers);
-            }
+            removeFollower(deps.getDb(), inbox);
           }
           return res.status(202).json({ ok: true });
         }
 
         if (body.type === 'Accept') {
-          const actorRef = typeof body.actor === 'string' ? body.actor : null;
+          const actorRef = typeof body.actor === 'string' ? body.actor.replace(/\/+$/, '') : null;
           if (actorRef) {
-            const relays = await loadRelays(deps.dataDir);
-            if (relays[actorRef] && relays[actorRef].status !== 'accepted') {
-              relays[actorRef].status = 'accepted';
-              await saveRelays(deps.dataDir, relays);
+            const db = deps.getDb();
+            const existing = getRelay(db, actorRef);
+            if (existing && existing.status !== 'accepted') {
+              upsertRelay(db, actorRef, { ...existing, status: 'accepted' });
               console.log(`ActivityPub relay accepted follow: ${actorRef}`);
             }
           }

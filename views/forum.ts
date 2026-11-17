@@ -36,7 +36,7 @@ export interface ForumPageProps {
   messages: ForumMessage[];
   replyTo: string;
   ipfsGatewayUrl: string;
-  powDifficultyBits?: number;
+  powHashesPerSecond?: number;
 }
 
 const ADJECTIVES = [
@@ -95,6 +95,123 @@ function escapeHtml(value: unknown): string {
     .replace(/'/g, '&#39;');
 }
 
+const ALLOWED_POST_TAGS = new Set([
+  'p', 'br', 'a', 'span', 'strong', 'b', 'em', 'i', 'u', 's', 'del',
+  'code', 'pre', 'blockquote', 'ul', 'ol', 'li', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'hr',
+]);
+const VOID_POST_TAGS = new Set(['br', 'hr']);
+
+function isSafeHref(rawHref: string): boolean {
+  const decoded = rawHref
+    .replace(/&#x([0-9a-f]+);?/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
+    .replace(/&#([0-9]+);?/g, (_, dec) => String.fromCharCode(parseInt(dec, 10)))
+    .replace(/[\u0000-\u0020]+/g, '')
+    .toLowerCase();
+  return (
+    decoded.startsWith('http://') ||
+    decoded.startsWith('https://') ||
+    decoded.startsWith('mailto:') ||
+    decoded.startsWith('/') ||
+    decoded.startsWith('#')
+  );
+}
+
+function escapeTextNode(value: string): string {
+  return value
+    .replace(/&(?!(?:#\d+|#x[0-9a-fA-F]+|[a-zA-Z0-9]+);)/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function buildSafeTag(rawTagContent: string): string {
+  const trimmed = rawTagContent.trim();
+  const isClosing = trimmed.startsWith('/');
+  const body = isClosing ? trimmed.slice(1).trim() : trimmed.replace(/\/$/, '').trim();
+  const spaceIdx = body.search(/\s/);
+  const tag = (spaceIdx === -1 ? body : body.slice(0, spaceIdx)).toLowerCase();
+  if (!ALLOWED_POST_TAGS.has(tag)) {
+    return '';
+  }
+  if (isClosing) {
+    return VOID_POST_TAGS.has(tag) ? '' : `</${tag}>`;
+  }
+
+  const rawAttrs = spaceIdx === -1 ? '' : body.slice(spaceIdx);
+  const safeAttrs: string[] = [];
+  const attrRegex = /([a-zA-Z0-9:-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/g;
+  let match: RegExpExecArray | null;
+  while ((match = attrRegex.exec(rawAttrs)) !== null) {
+    const attrName = match[1].toLowerCase();
+    const attrVal = (match[2] ?? match[3] ?? match[4] ?? '').trim();
+    if (tag === 'a' && attrName === 'href' && isSafeHref(attrVal)) {
+      safeAttrs.push(`href="${escapeHtml(attrVal)}"`);
+    } else if (attrName === 'class' && /^[a-zA-Z0-9_\-\s]+$/.test(attrVal)) {
+      safeAttrs.push(`class="${escapeHtml(attrVal)}"`);
+    }
+  }
+  if (tag === 'a') {
+    safeAttrs.push('target="_blank"', 'rel="noopener noreferrer"');
+  }
+  const attrStr = safeAttrs.length > 0 ? ` ${safeAttrs.join(' ')}` : '';
+  return `<${tag}${attrStr}>`;
+}
+
+export function sanitizePostHtml(value: unknown): string {
+  let cleaned = String(value == null ? '' : value).replace(/<!--[\s\S]*?-->/g, '');
+  let prev = '';
+  while (cleaned !== prev) {
+    prev = cleaned;
+    cleaned = cleaned.replace(
+      /<(script|style|iframe|object|embed|applet|svg|math|form|textarea)\b[\s\S]*?<\/\1>/gi,
+      ''
+    );
+  }
+
+  // Tokenize character-by-character respecting quoted attributes; escape all text nodes
+  const out: string[] = [];
+  let i = 0;
+  const len = cleaned.length;
+  while (i < len) {
+    const lt = cleaned.indexOf('<', i);
+    if (lt === -1) {
+      out.push(escapeTextNode(cleaned.slice(i)));
+      break;
+    }
+    if (lt > i) {
+      out.push(escapeTextNode(cleaned.slice(i, lt)));
+    }
+    // Scan for matching '>' outside quotes
+    let j = lt + 1;
+    let quote: string | null = null;
+    while (j < len) {
+      const ch = cleaned[j];
+      if (quote) {
+        if (ch === quote) quote = null;
+      } else if (ch === '"' || ch === "'") {
+        quote = ch;
+      } else if (ch === '>') {
+        break;
+      }
+      j++;
+    }
+    if (j >= len) {
+      // Unclosed '<' -> escape the rest as text
+      out.push(escapeTextNode(cleaned.slice(lt)));
+      break;
+    }
+    const rawInside = cleaned.slice(lt + 1, j);
+    if (/^\/?[a-zA-Z][a-zA-Z0-9-]*(?:\s|\/|$)/.test(rawInside.trim())) {
+      out.push(buildSafeTag(rawInside));
+    } else {
+      out.push(escapeTextNode(cleaned.slice(lt, j + 1)));
+    }
+    i = j + 1;
+  }
+  return out.join('');
+}
+
 interface ThreadNode {
   message: ForumMessage;
   children: ThreadNode[];
@@ -121,6 +238,20 @@ function buildThreadTree(messages: ForumMessage[]): ThreadNode[] {
   return roots;
 }
 
+export function formatCredMiningTime(cred: number): string {
+  const seconds = cred;
+  if (seconds < 60) {
+    return `${seconds < 10 ? seconds.toFixed(1).replace(/\.0$/, '') : Math.round(seconds)}s`;
+  }
+  if (seconds < 3600) {
+    return `${(seconds / 60).toFixed(1).replace(/\.0$/, '')}m`;
+  }
+  if (seconds < 86400) {
+    return `${(seconds / 3600).toFixed(1).replace(/\.0$/, '')}h`;
+  }
+  return `${(seconds / 86400).toFixed(1).replace(/\.0$/, '')}d`;
+}
+
 function countDescendants(node: ThreadNode): number {
   let count = 0;
   for (const child of node.children) {
@@ -129,7 +260,13 @@ function countDescendants(node: ThreadNode): number {
   return count;
 }
 
-function renderMessage(node: ThreadNode, board: string, replyTo: string, ipfsGatewayUrl: string): string {
+function renderMessage(
+  node: ThreadNode,
+  board: string,
+  replyTo: string,
+  ipfsGatewayUrl: string,
+  powDifficultyBits: number = 16
+): string {
   const { message, children } = node;
   const id = message.id || '';
   const isOpen = replyTo === id ? ' open' : '';
@@ -162,7 +299,17 @@ function renderMessage(node: ThreadNode, board: string, replyTo: string, ipfsGat
   const renderedAuthor = safeAuthorUrl
     ? `<a class="message-author" href="${escapeHtml(safeAuthorUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(author)}</a>`
     : `<span class="message-author">${escapeHtml(author)}</span>`;
-  const credTooltip = 'Cred is verifiable proof-of-work mined for this public key.';
+  const isFediversePost = Boolean(message.author || id.includes('-fedi-'));
+  const signerName = deriveUsername(message.pubkey);
+  const signerAvatarUri = deriveAvatarDataUri(message.pubkey);
+  const renderedSigner =
+    isFediversePost && message.pubkey
+      ? `<span class="message-signer" title="Signed by server key (${escapeHtml(signerName)})">signed by <img class="signer-avatar" src="${signerAvatarUri}" alt="${escapeHtml(signerName)} avatar" width="16" height="16"> <strong>${escapeHtml(signerName)}</strong></span>`
+      : '';
+  const estTime = message.cred && message.cred > 0 ? formatCredMiningTime(message.cred) : '';
+  const credTooltip = estTime
+    ? `Cred is verifiable proof-of-work mined for this public key (~${estTime} at 100k H/s; 1 cred = 1 expected second).`
+    : 'Cred is verifiable proof-of-work mined for this public key.';
   const renderedCred = message.cred && message.cred > 0
     ? `<span class="message-cred" title="${escapeHtml(credTooltip)}">Cred: <strong>${escapeHtml(message.cred)}</strong></span>`
     : '';
@@ -173,7 +320,7 @@ function renderMessage(node: ThreadNode, board: string, replyTo: string, ipfsGat
       <details class="thread-replies">
         <summary class="replies-toggle">${totalReplies} ${totalReplies === 1 ? 'reply' : 'replies'}</summary>
         <div class="thread-children">
-          ${children.map((child) => renderMessage(child, board, replyTo, ipfsGatewayUrl)).join('\n')}
+          ${children.map((child) => renderMessage(child, board, replyTo, ipfsGatewayUrl, powDifficultyBits)).join('\n')}
         </div>
       </details>`
     : '';
@@ -184,9 +331,10 @@ function renderMessage(node: ThreadNode, board: string, replyTo: string, ipfsGat
         <div class="message-header">
           <img class="message-avatar" src="${avatarUri}" alt="${escapeHtml(author)} avatar" width="28" height="28">
           ${renderedAuthor}
+          ${renderedSigner}
           ${renderedCred}
         </div>
-        <div class="message-data">${escapeHtml(message.data)}</div>${renderedImage}
+        <div class="message-data">${sanitizePostHtml(message.data)}</div>${renderedImage}
         <details class="meta-details">
           <summary class="meta-toggle">Metadata</summary>
           <div class="meta-content">
@@ -210,7 +358,7 @@ function renderMessage(node: ThreadNode, board: string, replyTo: string, ipfsGat
   `;
 }
 
-function renderForumPage({ board, boards, messages, replyTo, ipfsGatewayUrl, powDifficultyBits = 16 }: ForumPageProps): string {
+function renderForumPage({ board, boards, messages, replyTo, ipfsGatewayUrl, powHashesPerSecond = 100000 }: ForumPageProps): string {
   const safeBoard = escapeHtml(board);
   const availableBoards = Array.from(new Set(boards && boards.length ? boards : [board])).sort();
   const renderedBoards = availableBoards
@@ -235,12 +383,12 @@ function renderForumPage({ board, boards, messages, replyTo, ipfsGatewayUrl, pow
     <script src="/client.js" defer></script>
   </head>
   <body>
-    <div class="app" data-board="${safeBoard}" data-pow-difficulty-bits="${escapeHtml(powDifficultyBits)}">
+    <div class="app" data-board="${safeBoard}" data-pow-hashes-per-second="${escapeHtml(powHashesPerSecond)}">
       <header class="app-header">
         <h2>You're on board ${safeBoard}</h2>
         <form method="GET" action="/" class="board-switcher">
           <label for="board-select">Board:</label>
-          <select id="board-select" name="board" onchange="this.form.submit()">
+          <select id="board-select" name="board">
             ${renderedBoards}
           </select>
         </form>

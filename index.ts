@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import https from 'node:https';
+import { DatabaseSync } from 'node:sqlite';
 import express from 'express';
 import type { Request } from 'express';
 import cors from 'cors';
@@ -57,10 +58,10 @@ try {
 
 const IPFS_GATEWAY_URL = (process.env.IPFS_GATEWAY_URL || '/ipfs').replace(/\/+$/, '');
 const IPFS_DATA_DIR = path.resolve(process.env.IPFS_DATA_DIR || path.join(__dirname, 'ipfs-data'));
-const LOGS_DIR = path.resolve(process.env.LOGS_DIR || path.join(IPFS_DATA_DIR, 'logs'));
+const DB_PATH = path.resolve(process.env.DB_PATH || path.join(__dirname, 'pachytalk.db'));
 const app = express();
-const POW_DIFFICULTY_BITS = Math.min(63, Math.max(1, Number(process.env.POW_DIFFICULTY_BITS) || 16));
-const POW_BASE_TARGET = 1n << BigInt(64 - POW_DIFFICULTY_BITS);
+const POW_HASHES_PER_SECOND = Math.max(1, Number(process.env.POW_HASHES_PER_SECOND) || 100000);
+const POW_BASE_TARGET = (1n << 64n) / BigInt(POW_HASHES_PER_SECOND);
 const POW_CRED_SCALE = BigInt(Number(process.env.POW_CRED_SCALE) || 1);
 
 function scoreDigestCred(bytes: Uint8Array): number {
@@ -116,7 +117,11 @@ async function getIpfs(): Promise<IpfsServices> {
             fs.mkdirSync(IPFS_DATA_DIR, { recursive: true });
             const blockstore = new FsBlockstore(path.join(IPFS_DATA_DIR, 'blocks'));
             const datastore = new FsDatastore(path.join(IPFS_DATA_DIR, 'data'));
-            const helia = createHelia({ blockstore, datastore });
+            const helia = createHelia({
+                blockstore,
+                datastore,
+                http: { delegatedRouters: [] },
+            });
             await helia.start();
             console.log('Embedded IPFS node started:', helia.libp2p.peerId.toString());
             return { helia, ufs: unixfs(helia) };
@@ -144,47 +149,74 @@ async function readBytesFromIpfs(cidStr: string): Promise<Buffer> {
     return Buffer.concat(chunks);
 }
 
-const CREDS_INDEX_PATH = path.join(LOGS_DIR, 'creds.json');
-let credIndexPromise: Promise<Record<string, number>> | null = null;
+let dbInstance: DatabaseSync | null = null;
+
+function getDb(): DatabaseSync {
+    if (!dbInstance) {
+        fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+        const db = new DatabaseSync(DB_PATH);
+        db.exec(`
+            PRAGMA journal_mode = WAL;
+            PRAGMA synchronous = NORMAL;
+            CREATE TABLE IF NOT EXISTS messages (
+                id TEXT PRIMARY KEY,
+                board TEXT NOT NULL,
+                leaf TEXT NOT NULL,
+                depth INTEGER NOT NULL,
+                data TEXT NOT NULL,
+                pubkey TEXT NOT NULL,
+                sig TEXT NOT NULL,
+                content_cid TEXT,
+                media_type TEXT,
+                author TEXT,
+                author_url TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_messages_board_id ON messages(board, id);
+            CREATE INDEX IF NOT EXISTS idx_messages_leaf ON messages(leaf);
+            CREATE TABLE IF NOT EXISTS creds (
+                pubkey_hash TEXT PRIMARY KEY,
+                nonce INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS activitypub_followers (
+                inbox TEXT PRIMARY KEY
+            );
+            CREATE TABLE IF NOT EXISTS activitypub_relays (
+                actor_url TEXT PRIMARY KEY,
+                inbox TEXT NOT NULL,
+                status TEXT NOT NULL,
+                followed_at TEXT NOT NULL
+            );
+        `);
+        dbInstance = db;
+    }
+    return dbInstance;
+}
 
 function getPubkeyHash(pubkey: string): string {
     return crypto.createHash('sha256').update(pubkey).digest('hex');
 }
 
-function getCredIndex(): Promise<Record<string, number>> {
-    if (!credIndexPromise) {
-        credIndexPromise = (async () => {
-            try {
-                const raw = await fs.promises.readFile(CREDS_INDEX_PATH, 'utf8');
-                const parsed = JSON.parse(raw);
-                if (!parsed || typeof parsed !== 'object') {
-                    return {};
-                }
-                const out: Record<string, number> = {};
-                for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
-                    if (typeof v === 'number' && Number.isInteger(v) && v >= 0) {
-                        out[k] = v;
-                    }
-                }
-                return out;
-            } catch (err) {
-                if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-                    return {};
-                }
-                credIndexPromise = null;
-                throw err;
-            }
-        })();
+async function getCredIndex(): Promise<Record<string, number>> {
+    const rows = getDb()
+        .prepare('SELECT pubkey_hash, nonce FROM creds')
+        .all() as Array<{ pubkey_hash: string; nonce: number }>;
+    const out: Record<string, number> = {};
+    for (const row of rows) {
+        if (typeof row.nonce === 'number' && Number.isInteger(row.nonce) && row.nonce >= 0) {
+            out[row.pubkey_hash] = row.nonce;
+        }
     }
-    return credIndexPromise;
+    return out;
 }
 
 async function getPubkeyCred(pubkey: string): Promise<{ cred: number; nonce: number | null }> {
     if (!pubkey) {
         return { cred: 0, nonce: null };
     }
-    const index = await getCredIndex();
-    const nonce = index[getPubkeyHash(pubkey)];
+    const row = getDb()
+        .prepare('SELECT nonce FROM creds WHERE pubkey_hash = ?')
+        .get(getPubkeyHash(pubkey)) as { nonce?: number } | undefined;
+    const nonce = row?.nonce;
     if (typeof nonce !== 'number') {
         return { cred: 0, nonce: null };
     }
@@ -207,10 +239,11 @@ async function upsertPubkeyCred(
     if (cred <= existing.cred) {
         return { ok: true, cred: existing.cred, updated: false };
     }
-    const index = await getCredIndex();
-    index[getPubkeyHash(pubkey)] = validProof.nonce;
-    await fs.promises.mkdir(LOGS_DIR, { recursive: true });
-    await fs.promises.writeFile(CREDS_INDEX_PATH, JSON.stringify(index, null, 2), 'utf8');
+    getDb()
+        .prepare(
+            'INSERT INTO creds (pubkey_hash, nonce) VALUES (?, ?) ON CONFLICT(pubkey_hash) DO UPDATE SET nonce = excluded.nonce'
+        )
+        .run(getPubkeyHash(pubkey), validProof.nonce);
     return { ok: true, cred, updated: true };
 }
 
@@ -237,6 +270,22 @@ async function attachCredToMessages(messages: MessageRow[]): Promise<MessageRow[
     }));
 }
 
+function rowToMessage(row: Record<string, unknown>): MessageRow {
+    return {
+        id: String(row.id),
+        depth: Number(row.depth),
+        data: String(row.data),
+        pubkey: String(row.pubkey),
+        sig: String(row.sig),
+        content_cid: typeof row.content_cid === 'string' ? row.content_cid : null,
+        ...(typeof row.media_type === 'string'
+            ? { media_type: row.media_type as MessageRow['media_type'] }
+            : {}),
+        ...(typeof row.author === 'string' && row.author ? { author: row.author } : {}),
+        ...(typeof row.author_url === 'string' && row.author_url ? { author_url: row.author_url } : {}),
+    };
+}
+
 async function listMessagesFromIpfs(prefix?: string): Promise<MessageRow[]> {
     const normalized = String(prefix || '')
         .split('/')
@@ -246,11 +295,14 @@ async function listMessagesFromIpfs(prefix?: string): Promise<MessageRow[]> {
         return readMessageLog();
     }
     const board = sanitizeBoard(normalized[0]);
-    const messages = await readMessageLog(board);
+    if (normalized.length === 1) {
+        return readMessageLog(board);
+    }
     const targetPrefix = `/${[board, ...normalized.slice(1)].join('/')}`;
-    return messages
-        .filter((m) => m.id === targetPrefix || m.id.startsWith(`${targetPrefix}/`))
-        .sort((a, b) => a.id.localeCompare(b.id));
+    const rows = getDb()
+        .prepare('SELECT * FROM messages WHERE board = ? AND (id = ? OR id LIKE ?) ORDER BY id ASC')
+        .all(board, targetPrefix, `${targetPrefix}/%`) as Array<Record<string, unknown>>;
+    return attachCredToMessages(rows.map(rowToMessage));
 }
 
 function getBoardFromId(id: string): string {
@@ -258,120 +310,63 @@ function getBoardFromId(id: string): string {
     return sanitizeBoard(first);
 }
 
-function getBoardLogPath(board: string): string {
-    return path.join(LOGS_DIR, `${sanitizeBoard(board)}.log`);
-}
-
-interface BoardLogState {
-    ids: Set<string>;
-    messages: MessageRow[];
-}
-
-const boardLogs = new Map<string, Promise<BoardLogState>>();
-
-function getBoardLogState(board: string): Promise<BoardLogState> {
-    const cleanBoard = sanitizeBoard(board);
-    let statePromise = boardLogs.get(cleanBoard);
-    if (!statePromise) {
-        statePromise = (async () => {
-            const ids = new Set<string>();
-            const messages: MessageRow[] = [];
-            try {
-                const raw = await fs.promises.readFile(getBoardLogPath(cleanBoard), 'utf8');
-                for (const rawLine of raw.split('\n')) {
-                    const line = rawLine.trim();
-                    if (!line) continue;
-                    const msg = JSON.parse(line) as MessageRow;
-                    if (msg && msg.id && !ids.has(msg.id)) {
-                        ids.add(msg.id);
-                        messages.push(msg);
-                    }
-                }
-                return { ids, messages };
-            } catch (err) {
-                if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-                    return { ids, messages };
-                }
-                boardLogs.delete(cleanBoard);
-                throw err;
-            }
-        })();
-        boardLogs.set(cleanBoard, statePromise);
-    }
-    return statePromise;
-}
-
 async function appendMessageLog(message: MessageRow): Promise<boolean> {
-    const cleanMessage: MessageRow = {
-        id: message.id,
-        depth: message.depth,
-        data: message.data,
-        pubkey: message.pubkey,
-        sig: message.sig,
-        content_cid: message.content_cid,
-        ...(message.media_type ? { media_type: message.media_type } : {}),
-        ...(message.author ? { author: message.author } : {}),
-        ...(message.author_url ? { author_url: message.author_url } : {}),
-    };
-    const board = getBoardFromId(cleanMessage.id);
-    const state = await getBoardLogState(board);
-    if (state.ids.has(cleanMessage.id)) {
-        return false;
-    }
-    state.ids.add(cleanMessage.id);
-    state.messages.push(cleanMessage);
-    const logPath = getBoardLogPath(board);
-    try {
-        await fs.promises.mkdir(path.dirname(logPath), { recursive: true });
-        await fs.promises.appendFile(logPath, `${JSON.stringify(cleanMessage)}\n`, 'utf8');
-        return true;
-    } catch (err) {
-        state.ids.delete(cleanMessage.id);
-        state.messages.pop();
-        throw err;
-    }
+    const board = getBoardFromId(message.id);
+    const leaf = message.id.split('/').pop() || '';
+    const res = getDb()
+        .prepare(
+            `INSERT OR IGNORE INTO messages
+             (id, board, leaf, depth, data, pubkey, sig, content_cid, media_type, author, author_url)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+            message.id,
+            board,
+            leaf,
+            message.depth,
+            message.data,
+            message.pubkey,
+            message.sig,
+            message.content_cid ?? null,
+            message.media_type ?? null,
+            message.author ?? null,
+            message.author_url ?? null
+        );
+    return Number(res.changes) > 0;
 }
 
 async function listBoardsFromDisk(): Promise<string[]> {
-    try {
-        const entries = await fs.promises.readdir(LOGS_DIR, { withFileTypes: true });
-        return entries
-            .filter((e) => e.isFile() && e.name.endsWith('.log'))
-            .map((e) => e.name.slice(0, -4));
-    } catch (err) {
-        if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-            return [];
-        }
-        throw err;
-    }
-}
-
-function filterBySince(entries: MessageRow[], since?: string): MessageRow[] {
-    if (!since) {
-        return entries;
-    }
-    return entries.filter((msg) => {
-        const leaf = msg.id.split('/').pop() || '';
-        return leaf > since;
-    });
+    const rows = getDb()
+        .prepare('SELECT DISTINCT board FROM messages ORDER BY board ASC')
+        .all() as Array<{ board: string }>;
+    return rows.map((r) => r.board);
 }
 
 async function readMessageLog(board?: string, offset: number = 0, since?: string): Promise<MessageRow[]> {
-    const boards = board ? [sanitizeBoard(board)] : await listBoardsFromDisk();
-    const messages: MessageRow[] = [];
-    for (const b of boards) {
-        const state = await getBoardLogState(b);
-        messages.push(...state.messages);
+    const clauses: string[] = [];
+    const params: Array<string | number> = [];
+    if (board) {
+        clauses.push('board = ?');
+        params.push(sanitizeBoard(board));
     }
-    const withCred = await attachCredToMessages(messages);
-    withCred.sort((a, b) => a.id.localeCompare(b.id));
-    const filtered = filterBySince(withCred, since);
-    return offset > 0 ? filtered.slice(offset) : filtered;
+    if (since) {
+        clauses.push('leaf > ?');
+        params.push(since);
+    }
+    const whereSql = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+    const offsetSql = offset > 0 ? ' LIMIT -1 OFFSET ?' : '';
+    if (offset > 0) {
+        params.push(offset);
+    }
+    const rows = getDb()
+        .prepare(`SELECT * FROM messages ${whereSql} ORDER BY id ASC${offsetSql}`)
+        .all(...params) as Array<Record<string, unknown>>;
+    return attachCredToMessages(rows.map(rowToMessage));
 }
 
 async function hasMessageId(id: string): Promise<boolean> {
-    const state = await getBoardLogState(getBoardFromId(id));
-    return state.ids.has(id);
+    const row = getDb().prepare('SELECT 1 FROM messages WHERE id = ?').get(id);
+    return Boolean(row);
 }
 
 async function saveMessage(message: MessageRow): Promise<boolean> {
@@ -423,8 +418,12 @@ app.get('/', async (req, res) => {
             messages: rows,
             replyTo,
             ipfsGatewayUrl: IPFS_GATEWAY_URL,
-            powDifficultyBits: POW_DIFFICULTY_BITS,
+            powHashesPerSecond: POW_HASHES_PER_SECOND,
         });
+        res.setHeader(
+            'Content-Security-Policy',
+            "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: https: http:; media-src 'self' https: http:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+        );
         res.type('html').send(html);
     } catch (e) {
         console.error(e);
@@ -725,7 +724,7 @@ function getDomain(req?: Request): string {
 const activityPubDeps = {
   getDomain,
   getServerIdentity: getOrCreateServerIdentity,
-  dataDir: IPFS_DATA_DIR,
+  getDb,
   onIncomingNote: routeIncomingNote,
 };
 
@@ -776,7 +775,8 @@ let serverIdentityPromise: Promise<ServerIdentity> | null = null;
 function getOrCreateServerIdentity(): Promise<ServerIdentity> {
   if (!serverIdentityPromise) {
     serverIdentityPromise = (async () => {
-      const keyPath = path.join(IPFS_DATA_DIR, 'server-key.json');
+      const baseDir = process.env.STATE_DIR ? path.resolve(process.env.STATE_DIR) : __dirname;
+      const keyPath = path.join(baseDir, 'server-key.json');
       try {
         const raw = await fs.promises.readFile(keyPath, 'utf8');
         const parsed = JSON.parse(raw) as ServerIdentity;
@@ -855,9 +855,11 @@ async function routeIncomingNote(note: IncomingActivityPubNote): Promise<void> {
   }
 }
 
-followRelays(activityPubDeps).catch((err) => {
-  console.error('ActivityPub relay follow error:', err);
-});
+if (process.env.ACTIVITYPUB_RELAYS_ENABLED === '1' || process.env.ACTIVITYPUB_RELAYS_ENABLED === 'true') {
+  followRelays(activityPubDeps).catch((err) => {
+    console.error('ActivityPub relay follow error:', err);
+  });
+}
 
 async function handleFirehoseStatus(status: FediverseStatus, host: string): Promise<void> {
   const tags = (status.tags || [])
@@ -883,7 +885,7 @@ async function handleFirehoseStatus(status: FediverseStatus, host: string): Prom
   });
 }
 
-if (process.env.FIREHOSE_ENABLED !== '0' && process.env.FIREHOSE_ENABLED !== 'false') {
+if (process.env.FIREHOSE_ENABLED === '1' || process.env.FIREHOSE_ENABLED === 'true') {
   startFirehose({ onStatus: handleFirehoseStatus }).catch((err) => {
     console.error('Firehose error:', err);
   });
