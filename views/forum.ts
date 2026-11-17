@@ -398,6 +398,7 @@ function renderForumPage({ board, boards, messages, replyTo, ipfsGatewayUrl, pow
           <button type="button" id="import-id-btn">Import ID</button>
           <input type="file" id="import-id-file" accept=".json,application/json" hidden>
           <button type="button" id="mine-cred-btn">Mine Cred</button>
+          <button type="button" id="mine-cred-multi-btn">Mine Cred (Multi-Core)</button>
           <span id="cred-mine-status" class="pow-status"></span>
         </div>
         <h3>You're posting as</h3>

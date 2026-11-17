@@ -175,14 +175,54 @@ async function sha256Bytes(input) {
   return new Uint8Array(digest);
 }
 
-function scoreDigestCred(bytes) {
-  const view = new DataView(bytes.buffer, bytes.byteOffset, 8);
-  const h64 = view.getBigUint64(0, false);
+function scoreH64Cred(h64) {
   if (h64 >= POW_BASE_TARGET) {
     return 0;
   }
   const scaled = (POW_BASE_TARGET * POW_CRED_SCALE) / (h64 + 1n);
   return scaled > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(scaled);
+}
+
+function scoreDigestCred(bytes) {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, 8);
+  return scoreH64Cred(view.getBigUint64(0, false));
+}
+
+const SHA256_K = new Uint32Array([
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+]);
+const SHA256_IV = new Uint32Array([
+  0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+  0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+]);
+
+let wasmMinerPromise = null;
+
+function getWasmMiner() {
+  if (!wasmMinerPromise) {
+    wasmMinerPromise = (async () => {
+      const res = await fetch('/pow.wasm');
+      const bytes = await res.arrayBuffer();
+      const { instance } = await WebAssembly.instantiate(bytes);
+      const { memory, compress, mine10k } = instance.exports;
+      const u8 = new Uint8Array(memory.buffer);
+      const u32 = new Uint32Array(memory.buffer);
+      const view = new DataView(memory.buffer);
+      u32.set(SHA256_K, 512 >> 2);
+      return { compress, mine10k, u8, u32, view };
+    })().catch((err) => {
+      wasmMinerPromise = null;
+      throw err;
+    });
+  }
+  return wasmMinerPromise;
 }
 
 const ADJECTIVES = [
@@ -256,9 +296,20 @@ async function init() {
   const importIdBtn = document.getElementById('import-id-btn');
   const importIdFile = document.getElementById('import-id-file');
   const mineCredBtn = document.getElementById('mine-cred-btn');
+  const mineCredMultiBtn = document.getElementById('mine-cred-multi-btn');
   const mineStatusEl = document.getElementById('cred-mine-status');
 
   let miningCred = false;
+  let activeWorkers = [];
+  const stopWorkers = () => {
+    for (const w of activeWorkers) {
+      w.terminate();
+    }
+    activeWorkers = [];
+    if (mineCredMultiBtn) {
+      mineCredMultiBtn.textContent = 'Mine Cred (Multi-Core)';
+    }
+  };
   let sessionCred = currentIdentity.bestPow
     ? scoreDigestCred(await sha256Bytes(`${currentIdentity.publicKeyPem}:${currentIdentity.bestPow.nonce}`))
     : 0;
@@ -285,6 +336,7 @@ async function init() {
       if (!file) return;
       try {
         miningCred = false;
+        stopWorkers();
         if (mineCredBtn) mineCredBtn.textContent = 'Mine Cred';
         const imported = await importIdentityFromJson(await file.text());
         currentIdentity = imported;
@@ -310,6 +362,7 @@ async function init() {
       newIdBtn.disabled = true;
       try {
         miningCred = false;
+        stopWorkers();
         sessionCred = 0;
         if (mineCredBtn) mineCredBtn.textContent = 'Mine Cred';
         if (mineStatusEl) mineStatusEl.textContent = '';
@@ -354,6 +407,7 @@ async function init() {
 
   if (mineCredBtn) {
     mineCredBtn.addEventListener('click', async () => {
+      stopWorkers();
       if (miningCred) {
         miningCred = false;
         return;
@@ -366,7 +420,7 @@ async function init() {
       const pubkey = currentIdentity.publicKeyPem;
       const rand = new Uint32Array(1);
       window.crypto.getRandomValues(rand);
-      let nonce = rand[0] * 1000000;
+      let nonce = Math.max(10000, rand[0] * 1000000);
       let hashes = 0;
       try {
         const sig = await signText(pubkey, currentIdentity.privateKey);
@@ -378,29 +432,59 @@ async function init() {
             mineStatusEl.textContent = `Cred: ${sessionCred} (mining...)`;
           }
         }
+
+        const miner = await getWasmMiner();
+        const encoder = new TextEncoder();
+        const prefixBytes = encoder.encode(`${pubkey}:`);
+        const fullBlocks = Math.floor(prefixBytes.length / 64);
+        const midstateOffset = fullBlocks * 64;
+        const tailBase = prefixBytes.subarray(midstateOffset);
+
+        miner.u32.set(SHA256_IV, 0);
+        for (let b = 0; b < fullBlocks; b++) {
+          miner.u8.set(prefixBytes.subarray(b * 64, (b + 1) * 64), 64);
+          miner.compress(0, 64);
+        }
+
+        let bestH64 = sessionCred > 0
+          ? (POW_BASE_TARGET * POW_CRED_SCALE) / BigInt(sessionCred)
+          : POW_BASE_TARGET;
+        miner.view.setBigUint64(32, bestH64, true);
+
         while (miningCred && pubkey === currentIdentity.publicKeyPem) {
-          const digest = await sha256Bytes(`${pubkey}:${nonce}`);
-          const cred = scoreDigestCred(digest);
-          if (cred > sessionCred) {
-            const json = await submitCredProof(pubkey, sig, nonce);
-            sessionCred = Number(json.cred ?? cred);
-            currentIdentity.bestPow = { nonce };
-            saveBestPowToIdentity(pubkey, currentIdentity.bestPow);
-            updateDomCredForPubkey(pubkey, sessionCred);
-            if (mineStatusEl) {
-              mineStatusEl.textContent = `Cred: ${sessionCred} (${hashes} hashes)`;
+          const noncePrefixBytes = encoder.encode(String(nonce).slice(0, -4));
+          const digitPos = tailBase.length + noncePrefixBytes.length;
+          const totalLen = midstateOffset + digitPos + 4;
+
+          miner.u8.fill(0, 64, 128);
+          miner.u8.set(tailBase, 64);
+          miner.u8.set(noncePrefixBytes, 64 + tailBase.length);
+          miner.u8[64 + digitPos + 4] = 0x80;
+          miner.view.setBigUint64(64 + 56, BigInt(totalLen * 8), false);
+
+          const bestK = miner.mine10k(digitPos);
+          hashes += 10000;
+
+          if (bestK >= 0) {
+            bestH64 = miner.view.getBigUint64(32, true);
+            const cred = scoreH64Cred(bestH64);
+            if (cred > sessionCred) {
+              const winningNonce = nonce + bestK;
+              const json = await submitCredProof(pubkey, sig, winningNonce);
+              sessionCred = Number(json.cred ?? cred);
+              currentIdentity.bestPow = { nonce: winningNonce };
+              saveBestPowToIdentity(pubkey, currentIdentity.bestPow);
+              updateDomCredForPubkey(pubkey, sessionCred);
             }
           }
-          nonce++;
-          hashes++;
-          if (hashes % 250 === 0) {
-            if (mineStatusEl) {
-              mineStatusEl.textContent = sessionCred > 0
-                ? `Cred: ${sessionCred} (${hashes} hashes)`
-                : `Mining (${hashes} hashes)...`;
-            }
-            await new Promise((r) => setTimeout(r, 0));
+
+          nonce += 10000;
+          if (mineStatusEl) {
+            mineStatusEl.textContent = sessionCred > 0
+              ? `Cred: ${sessionCred} (${hashes} hashes)`
+              : `Mining (${hashes} hashes)...`;
           }
+          await new Promise((r) => setTimeout(r, 0));
         }
         mineCredBtn.textContent = 'Mine Cred';
         if (mineStatusEl) {
@@ -410,6 +494,108 @@ async function init() {
         miningCred = false;
         mineCredBtn.textContent = 'Mine Cred';
         alert(err instanceof Error ? err.message : 'Mining failed');
+        if (mineStatusEl) mineStatusEl.textContent = '';
+      }
+    });
+  }
+
+  if (mineCredMultiBtn) {
+    mineCredMultiBtn.addEventListener('click', async () => {
+      if (activeWorkers.length > 0) {
+        stopWorkers();
+        if (mineStatusEl) {
+          mineStatusEl.textContent = sessionCred > 0 ? `Cred: ${sessionCred}` : '';
+        }
+        return;
+      }
+      if (miningCred) {
+        miningCred = false;
+        if (mineCredBtn) mineCredBtn.textContent = 'Mine Cred';
+      }
+
+      const workerCount = Math.max(1, navigator.hardwareConcurrency || 4);
+      mineCredMultiBtn.textContent = `Stop Multi-Core (${workerCount}x)`;
+      if (mineStatusEl) {
+        mineStatusEl.textContent = sessionCred > 0
+          ? `Cred: ${sessionCred} (mining on ${workerCount} cores...)`
+          : `Mining on ${workerCount} cores...`;
+      }
+
+      const pubkey = currentIdentity.publicKeyPem;
+      const rand = new Uint32Array(1);
+      window.crypto.getRandomValues(rand);
+      const baseNonce = Math.max(10000, rand[0] * 1000000);
+      const stride = workerCount * 10000;
+      let totalHashes = 0;
+
+      try {
+        const sig = await signText(pubkey, currentIdentity.privateKey);
+        if (currentIdentity.bestPow && Number.isInteger(currentIdentity.bestPow.nonce)) {
+          const json = await submitCredProof(pubkey, sig, currentIdentity.bestPow.nonce);
+          sessionCred = Number(json.cred ?? sessionCred);
+          updateDomCredForPubkey(pubkey, sessionCred);
+        }
+
+        let globalBestH64 = sessionCred > 0
+          ? (POW_BASE_TARGET * POW_CRED_SCALE) / BigInt(sessionCred)
+          : POW_BASE_TARGET;
+        let submitChain = Promise.resolve();
+
+        for (let i = 0; i < workerCount; i++) {
+          const worker = new Worker('/pow-worker.js');
+          activeWorkers.push(worker);
+
+          worker.onmessage = (evt) => {
+            if (pubkey !== currentIdentity.publicKeyPem || activeWorkers.length === 0) return;
+            const msg = evt.data || {};
+            if (msg.type === 'progress') {
+              totalHashes += Number(msg.deltaHashes || 0);
+              if (mineStatusEl) {
+                mineStatusEl.textContent = sessionCred > 0
+                  ? `Cred: ${sessionCred} (${totalHashes} hashes, ${workerCount} cores)`
+                  : `Mining (${totalHashes} hashes, ${workerCount} cores)...`;
+              }
+              return;
+            }
+            if (msg.type === 'found') {
+              const foundH64 = BigInt(msg.bestH64);
+              const winningNonce = Number(msg.nonce);
+              if (foundH64 < globalBestH64) {
+                globalBestH64 = foundH64;
+                for (const w of activeWorkers) {
+                  w.postMessage({ type: 'updateTarget', bestH64: String(globalBestH64) });
+                }
+              }
+              const cred = scoreH64Cred(foundH64);
+              if (cred > sessionCred) {
+                sessionCred = cred;
+                currentIdentity.bestPow = { nonce: winningNonce };
+                saveBestPowToIdentity(pubkey, currentIdentity.bestPow);
+                updateDomCredForPubkey(pubkey, sessionCred);
+                submitChain = submitChain.then(async () => {
+                  try {
+                    const json = await submitCredProof(pubkey, sig, winningNonce);
+                    if (Number(json.cred) > sessionCred) {
+                      sessionCred = Number(json.cred);
+                      updateDomCredForPubkey(pubkey, sessionCred);
+                    }
+                  } catch {}
+                });
+              }
+            }
+          };
+
+          worker.postMessage({
+            type: 'start',
+            pubkey,
+            startNonce: baseNonce + i * 10000,
+            stride,
+            bestH64: String(globalBestH64),
+          });
+        }
+      } catch (err) {
+        stopWorkers();
+        alert(err instanceof Error ? err.message : 'Multi-core mining failed');
         if (mineStatusEl) mineStatusEl.textContent = '';
       }
     });

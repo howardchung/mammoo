@@ -109,6 +109,14 @@ interface IpfsServices {
     ufs: UnixFS;
 }
 
+const origStreamCancel = ReadableStream.prototype.cancel;
+ReadableStream.prototype.cancel = function (reason?: unknown): Promise<void> {
+    if (this.locked) {
+        return Promise.resolve();
+    }
+    return origStreamCancel.call(this, reason).catch(() => {});
+};
+
 let ipfsPromise: Promise<IpfsServices> | null = null;
 
 async function getIpfs(): Promise<IpfsServices> {
@@ -120,7 +128,7 @@ async function getIpfs(): Promise<IpfsServices> {
             const helia = createHelia({
                 blockstore,
                 datastore,
-                http: { delegatedRouters: [] },
+                http: { delegatedRouters: [], recursiveGateways: [] },
             });
             await helia.start();
             console.log('Embedded IPFS node started:', helia.libp2p.peerId.toString());
@@ -422,7 +430,7 @@ app.get('/', async (req, res) => {
         });
         res.setHeader(
             'Content-Security-Policy',
-            "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: https: http:; media-src 'self' https: http:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+            "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data: https: http:; media-src 'self' https: http:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
         );
         res.type('html').send(html);
     } catch (e) {
