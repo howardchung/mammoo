@@ -37,6 +37,33 @@ Ports
   * **IPFS / libp2p peers** (typically TCP/UDP `4001` and advertised peer ports) — DHT rendezvous and Bitswap.
   * **TCP `443`** — Outbound HTTPS stream for the Mastodon firehose.
 
+Environment Variables
+====
+All variables can be set in the environment or in `.env`:
+
+* **Server & TLS:**
+  * `PORT` — HTTP/HTTPS listen port (default: `3141`).
+  * `PUBLIC_URL` — Canonical external URL advertised to peers and used for ActivityPub links/actors (if unset, auto-detects public IP via network interface or `api.ipify.org`, falling back to `localhost`).
+  * `SSL_KEY_PATH` / `SSL_CERT_PATH` — Paths to TLS private key and certificate to serve HTTPS instead of HTTP.
+* **Storage & Uploads:**
+  * `IPFS_DATA_DIR` — Directory for embedded Helia IPFS blocks/data, `server-key.json`, and `activitypub-followers.json` (default: `./ipfs-data`).
+  * `LOGS_DIR` — Directory for per-board `.log` files and `creds.json` (default: `${IPFS_DATA_DIR}/logs`).
+  * `IPFS_GATEWAY_URL` — Base URL prefix for rendering attachment links (default: `/ipfs`).
+  * `MAX_UPLOAD_BYTES` — Maximum upload file size in bytes (default: `52428800` / 50 MB).
+* **Proof-of-Work (`cred`):**
+  * `POW_DIFFICULTY_BITS` — Required leading zero bits (`1`–`63`, default: `16`).
+  * `POW_CRED_SCALE` — Multiplier for `cred` scoring (default: `1`).
+* **Peer Discovery & Sync:**
+  * `PEERS` — Comma-separated list of static peer base URLs.
+  * `BOARDS` — Comma-separated list of additional board names to advertise.
+  * `BOOTSTRAP_BOARD` — Restrict peer sync to a single board name.
+  * `RENDEZVOUS_KEY` — Cluster key for IPFS DHT rendezvous (default: `pachytalk-v1`).
+  * `SYNC_INTERVAL_MS` — Periodic peer delta-polling interval in ms (`0` disables polling; default: `30000`).
+  * `DISCOVERY_INTERVAL_MS` — Periodic IPFS DHT rendezvous interval in ms (`0` disables DHT loop; default: `60000`).
+* **ActivityPub & Relays:**
+  * `ACTIVITYPUB_RELAYS` — Comma-separated ActivityPub relay URLs to follow when `PUBLIC_URL` (or `SSL_CERT_PATH`) is a public `https://` domain (defaults to the non-pre-approval relays from `joinfediverse.wiki/Relays`; set empty to disable).
+  * `ACTIVITYPUB_INBOXES` — Comma-separated ActivityPub inbox URLs to always publish new posts to in addition to stored followers.
+
 TODO
 ====
 * add upvote/downvote (weighted by cred)

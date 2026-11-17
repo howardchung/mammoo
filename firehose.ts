@@ -23,6 +23,7 @@ export interface FediverseStatus {
         acct?: string;
         username?: string;
         display_name?: string;
+        url?: string;
     };
     media_attachments?: Array<{
         type?: string;
@@ -37,11 +38,10 @@ export interface FediverseStatus {
 export interface FirehoseOptions {
     hosts?: string[];
     token?: string;
-    pollIntervalMs?: number;
     onStatus?: (status: FediverseStatus, host: string) => void | Promise<void>;
 }
 
-const DEFAULT_HOSTS = ['fosstodon.org', 'hachyderm.io'];
+const DEFAULT_HOSTS = ['fedi.buzz'];
 
 function defaultOnStatus(status: FediverseStatus, host: string): void {
     const author = status.account?.acct || status.account?.username || 'unknown';
@@ -71,34 +71,40 @@ async function resolveHosts(explicitHosts?: string[]): Promise<string[]> {
                 if (picked.length > 0) return picked.slice(0, 3);
             }
         } catch {
-            // Fall back to default open instances
+            // Fall back to default host
         }
     }
     return DEFAULT_HOSTS;
 }
 
-async function trySseStream(
+async function streamHost(
     host: string,
     token: string | undefined,
-    onStatus: (status: FediverseStatus, host: string) => void | Promise<void>
-): Promise<boolean> {
-    const streamUrl = `https://${host}/api/v1/streaming/public`;
+    onStatus: (status: FediverseStatus, host: string) => void | Promise<void>,
+    signal: AbortSignal
+): Promise<void> {
+    const streamUrl = host.startsWith('http://') || host.startsWith('https://')
+        ? host
+        : `https://${host}/api/v1/streaming/public`;
     const headers: Record<string, string> = { Accept: 'text/event-stream' };
     if (token) {
         headers.Authorization = `Bearer ${token}`;
     }
-    const response = await fetch(streamUrl, {
-        headers,
-        signal: AbortSignal.timeout(10000),
-    });
+
+    const response = await fetch(streamUrl, { headers, signal });
     if (!response.ok || !response.body) {
-        response.body?.cancel().catch(() => {});
-        return false;
+        throw new Error(`Failed to stream ${streamUrl}: ${response.status} ${response.statusText}`);
     }
 
     console.log(`Firehose streaming SSE from ${streamUrl}`);
     let currentEvent = 'update';
-    const stream = Readable.fromWeb(response.body).pipe(split2());
+    const readable = Readable.fromWeb(response.body);
+    readable.on('error', (err: Error) => {
+        if (!signal.aborted) {
+            console.warn(`Firehose readable error on ${host}:`, err.message);
+        }
+    });
+    const stream = readable.pipe(split2());
     stream.on('data', (line: string) => {
         if (line.startsWith('event: ')) {
             currentEvent = line.slice(7).trim();
@@ -116,85 +122,28 @@ async function trySseStream(
         }
     });
     stream.on('error', (err: Error) => {
-        console.warn(`Firehose SSE error on ${host}:`, err.message);
-    });
-    return true;
-}
-
-async function pollPublicTimeline(
-    host: string,
-    sinceId: string | undefined,
-    onStatus: (status: FediverseStatus, host: string) => void | Promise<void>
-): Promise<string | undefined> {
-    const params = new URLSearchParams({ limit: '20' });
-    if (sinceId) {
-        params.set('since_id', sinceId);
-    }
-    const url = `https://${host}/api/v1/timelines/public?${params.toString()}`;
-    const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
-    if (!res.ok) {
-        throw new Error(`${url}: ${res.status} ${res.statusText}`);
-    }
-    const statuses = (await res.json()) as FediverseStatus[];
-    if (!Array.isArray(statuses) || statuses.length === 0) {
-        return sinceId;
-    }
-
-    // API returns newest-first; emit oldest-first and advance sinceId to newest
-    const ordered = [...statuses].reverse();
-    for (const status of ordered) {
-        if (status && status.id) {
-            await onStatus(status, host);
+        if (!signal.aborted) {
+            console.warn(`Firehose SSE error on ${host}:`, err.message);
         }
-    }
-    return statuses[0].id || sinceId;
+    });
 }
 
 export default async function start(options?: FirehoseOptions): Promise<() => void> {
     const hosts = await resolveHosts(options?.hosts);
     const token = options?.token ?? process.env.MASTODON_ACCESS_TOKEN;
-    const pollIntervalMs = options?.pollIntervalMs ?? (Number(process.env.FIREHOSE_POLL_MS) || 5000);
     const onStatus = options?.onStatus ?? defaultOnStatus;
+    const controller = new AbortController();
 
-    const pollingHosts: string[] = [];
     for (const host of hosts) {
-        try {
-            const streaming = await trySseStream(host, token, onStatus);
-            if (!streaming) {
-                pollingHosts.push(host);
+        streamHost(host, token, onStatus, controller.signal).catch((err) => {
+            if (!controller.signal.aborted) {
+                console.warn(`Firehose stream error (${host}):`, (err as Error).message);
             }
-        } catch {
-            pollingHosts.push(host);
-        }
-    }
-
-    let timer: NodeJS.Timeout | null = null;
-    if (pollingHosts.length > 0) {
-        const sinceIds = new Map<string, string>();
-        const tick = async () => {
-            for (const host of pollingHosts) {
-                try {
-                    const nextSince = await pollPublicTimeline(host, sinceIds.get(host), onStatus);
-                    if (nextSince) {
-                        sinceIds.set(host, nextSince);
-                    }
-                } catch (err) {
-                    console.warn(`Firehose poll error (${host}):`, (err as Error).message);
-                }
-            }
-        };
-
-        await tick();
-        if (pollIntervalMs > 0) {
-            timer = setInterval(() => {
-                void tick();
-            }, pollIntervalMs);
-            timer.unref?.();
-        }
+        });
     }
 
     return () => {
-        if (timer) clearInterval(timer);
+        controller.abort();
     };
 }
 

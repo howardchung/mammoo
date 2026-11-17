@@ -25,11 +25,14 @@ export interface ForumMessage {
   sig?: string;
   content_cid?: string | null;
   media_type?: MediaType | null;
+  author?: string | null;
+  author_url?: string | null;
   cred?: number;
 }
 
 export interface ForumPageProps {
   board: string;
+  boards?: string[];
   messages: ForumMessage[];
   replyTo: string;
   ipfsGatewayUrl: string;
@@ -150,8 +153,15 @@ function renderMessage(node: ThreadNode, board: string, replyTo: string, ipfsGat
       </div>`
     : '';
 
-  const author = deriveUsername(message.pubkey);
-  const avatarUri = deriveAvatarDataUri(message.pubkey);
+  const author = message.author ? message.author : deriveUsername(message.pubkey);
+  const avatarUri = deriveAvatarDataUri(message.author_url || message.author || message.pubkey);
+  const safeAuthorUrl =
+    message.author_url && (message.author_url.startsWith('http://') || message.author_url.startsWith('https://'))
+      ? message.author_url
+      : '';
+  const renderedAuthor = safeAuthorUrl
+    ? `<a class="message-author" href="${escapeHtml(safeAuthorUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(author)}</a>`
+    : `<span class="message-author">${escapeHtml(author)}</span>`;
   const credTooltip = 'Cred is verifiable proof-of-work mined for this public key.';
   const renderedCred = message.cred && message.cred > 0
     ? `<span class="message-cred" title="${escapeHtml(credTooltip)}">Cred: <strong>${escapeHtml(message.cred)}</strong></span>`
@@ -173,7 +183,7 @@ function renderMessage(node: ThreadNode, board: string, replyTo: string, ipfsGat
       <div class="message-card" data-pubkey="${escapeHtml(message.pubkey || '')}">
         <div class="message-header">
           <img class="message-avatar" src="${avatarUri}" alt="${escapeHtml(author)} avatar" width="28" height="28">
-          <span class="message-author">${escapeHtml(author)}</span>
+          ${renderedAuthor}
           ${renderedCred}
         </div>
         <div class="message-data">${escapeHtml(message.data)}</div>${renderedImage}
@@ -200,8 +210,15 @@ function renderMessage(node: ThreadNode, board: string, replyTo: string, ipfsGat
   `;
 }
 
-function renderForumPage({ board, messages, replyTo, ipfsGatewayUrl, powDifficultyBits = 16 }: ForumPageProps): string {
+function renderForumPage({ board, boards, messages, replyTo, ipfsGatewayUrl, powDifficultyBits = 16 }: ForumPageProps): string {
   const safeBoard = escapeHtml(board);
+  const availableBoards = Array.from(new Set(boards && boards.length ? boards : [board])).sort();
+  const renderedBoards = availableBoards
+    .map((b) => {
+      const selected = b === board ? ' selected' : '';
+      return `<option value="${escapeHtml(b)}"${selected}>${escapeHtml(b)}</option>`;
+    })
+    .join('');
   const tree = buildThreadTree(messages);
   const renderedMessages = tree.length
     ? tree.map((node) => renderMessage(node, board, replyTo, ipfsGatewayUrl)).join('\n')
@@ -221,6 +238,12 @@ function renderForumPage({ board, messages, replyTo, ipfsGatewayUrl, powDifficul
     <div class="app" data-board="${safeBoard}" data-pow-difficulty-bits="${escapeHtml(powDifficultyBits)}">
       <header class="app-header">
         <h2>You're on board ${safeBoard}</h2>
+        <form method="GET" action="/" class="board-switcher">
+          <label for="board-select">Board:</label>
+          <select id="board-select" name="board" onchange="this.form.submit()">
+            ${renderedBoards}
+          </select>
+        </form>
         <div class="header-actions">
           <button type="button" id="new-id-btn">Create New ID</button>
           <button type="button" id="export-id-btn">Export ID</button>

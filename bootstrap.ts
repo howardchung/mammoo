@@ -294,6 +294,8 @@ async function importPeerMessage(
     sig: msg.sig,
     content_cid: msg.content_cid,
     ...(msg.media_type ? { media_type: msg.media_type } : {}),
+    ...(msg.author ? { author: msg.author } : {}),
+    ...(msg.author_url ? { author_url: msg.author_url } : {}),
   });
   existingIds.add(msg.id);
   return saved;

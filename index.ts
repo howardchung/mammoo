@@ -18,7 +18,13 @@ import { buildMessageSignaturePayload, renderForumPage } from './views/forum.ts'
 import type { ForumMessage, PowProof } from './views/forum.ts';
 import startFirehose from './firehose.ts';
 import type { FediverseStatus } from './firehose.ts';
-import { createActivityPubRouter } from './activitypub.ts';
+import {
+    createActivityPubRootRouter,
+    createActivityPubRouter,
+    followRelays,
+    publishPostToFediverse,
+} from './activitypub.ts';
+import type { IncomingActivityPubNote } from './activitypub.ts';
 import {
     bootstrapFromPeer,
     createBootstrapRouter,
@@ -304,6 +310,8 @@ async function appendMessageLog(message: MessageRow): Promise<boolean> {
         sig: message.sig,
         content_cid: message.content_cid,
         ...(message.media_type ? { media_type: message.media_type } : {}),
+        ...(message.author ? { author: message.author } : {}),
+        ...(message.author_url ? { author_url: message.author_url } : {}),
     };
     const board = getBoardFromId(cleanMessage.id);
     const state = await getBoardLogState(board);
@@ -399,9 +407,19 @@ app.get('/', async (req, res) => {
     try {
         const board = sanitizeBoard(req.query.board);
         const replyTo = req.query.replyTo ? String(req.query.replyTo) : '';
-        const rows = await listMessagesFromIpfs(`/${board}`);
+        const [rows, diskBoards] = await Promise.all([
+            listMessagesFromIpfs(`/${board}`),
+            listBoardsFromDisk(),
+        ]);
+        const envBoards = (process.env.BOARDS || '')
+            .split(',')
+            .map((b) => b.trim())
+            .filter(Boolean)
+            .map((b) => sanitizeBoard(b));
+        const boards = Array.from(new Set(['default', board, ...diskBoards, ...envBoards])).sort();
         const html = renderForumPage({
             board,
+            boards,
             messages: rows,
             replyTo,
             ipfsGatewayUrl: IPFS_GATEWAY_URL,
@@ -543,6 +561,10 @@ apiRouter.post('/send', async (req, res) => {
         };
         await saveMessage(newMessage);
         void pushMessageToPeers(newMessage, getKnownPeers(getSelfUrl()), getSelfUrl());
+        void publishPostToFediverse(
+            { id, board: getBoardFromId(id), data, content_cid: contentCid },
+            activityPubDeps
+        );
         return res.json({ ok: true, id, content_cid: contentCid, media_type: mediaType });
     }
     catch(e) {
@@ -604,8 +626,36 @@ function getLocalInterfaceIp(): string {
     return privateFallback;
 }
 
+function getCertDomain(): string {
+    const certPath = process.env.SSL_CERT_PATH;
+    if (!certPath) return '';
+    try {
+        const cert = new crypto.X509Certificate(fs.readFileSync(certPath));
+        if (cert.subjectAltName) {
+            for (const entry of cert.subjectAltName.split(',')) {
+                const trimmed = entry.trim();
+                if (trimmed.startsWith('DNS:')) {
+                    const dns = trimmed.slice(4).trim();
+                    if (dns && !dns.startsWith('*')) {
+                        return dns;
+                    }
+                }
+            }
+        }
+        const cnMatch = cert.subject.match(/CN=([^\n,]+)/);
+        if (cnMatch && cnMatch[1] && !cnMatch[1].startsWith('*')) {
+            return cnMatch[1].trim();
+        }
+    } catch {
+        // Ignore unreadable cert
+    }
+    return '';
+}
+
+const certDomain = getCertDomain();
+
 async function resolvePublicHost(): Promise<void> {
-    if (process.env.PUBLIC_URL) return;
+    if (process.env.PUBLIC_URL || certDomain) return;
     const nicIp = getLocalInterfaceIp();
     if (nicIp && !isPrivateIpv4(nicIp)) {
         discoveredHost = nicIp;
@@ -637,8 +687,9 @@ function getSelfUrl(): string {
         return process.env.PUBLIC_URL.replace(/\/+$/, '');
     }
     const scheme = process.env.SSL_KEY_PATH && process.env.SSL_CERT_PATH ? 'https' : 'http';
-    const host = discoveredHost || getLocalInterfaceIp() || 'localhost';
-    return `${scheme}://${host}:${PORT}`;
+    const host = certDomain || discoveredHost || getLocalInterfaceIp() || 'localhost';
+    const defaultPort = (scheme === 'https' && PORT === 443) || (scheme === 'http' && PORT === 80);
+    return defaultPort ? `${scheme}://${host}` : `${scheme}://${host}:${PORT}`;
 }
 
 const bootstrapDeps = {
@@ -663,12 +714,25 @@ function getDomain(req?: Request): string {
       return new URL(process.env.PUBLIC_URL).host;
     } catch {}
   }
-  return req?.get('host') || `127.0.0.1:${PORT}`;
+  const reqHost = req?.get('host');
+  if (reqHost) return reqHost;
+  if (certDomain) {
+    return PORT === 443 ? certDomain : `${certDomain}:${PORT}`;
+  }
+  return `127.0.0.1:${PORT}`;
 }
+
+const activityPubDeps = {
+  getDomain,
+  getServerIdentity: getOrCreateServerIdentity,
+  dataDir: IPFS_DATA_DIR,
+  onIncomingNote: routeIncomingNote,
+};
 
 apiRouter.use(createActivityPubRouter(getDomain));
 
 app.use('/api', apiRouter);
+app.use(createActivityPubRootRouter(activityPubDeps));
 
 const sslKeyPath = process.env.SSL_KEY_PATH;
 const sslCertPath = process.env.SSL_CERT_PATH;
@@ -743,27 +807,27 @@ function signServerPayload(payload: string, privateKeyPem: string): string {
   return signer.sign(privateKeyPem, 'hex');
 }
 
-async function routeFirehoseStatus(status: FediverseStatus, host: string): Promise<void> {
-  const rawTags = Array.isArray(status.tags) ? status.tags : [];
+async function routeIncomingNote(note: IncomingActivityPubNote): Promise<void> {
   const boards = new Set<string>();
-  for (const tag of rawTags) {
-    const rawName = typeof tag?.name === 'string' ? tag.name.trim().toLowerCase() : '';
-    if (!rawName) continue;
-    const cleaned = rawName.replace(/[^a-zA-Z0-9_-]/g, '');
+  for (const tag of note.tags) {
+    const cleaned = tag.trim().toLowerCase().replace(/[^a-zA-Z0-9_-]/g, '');
     if (cleaned) {
       boards.add(sanitizeBoard(cleaned));
     }
   }
   if (boards.size === 0) return;
 
-  const data = status.content || status.url || status.id;
+  const data = note.content || note.url || note.id;
   if (!data) return;
 
-  const parsedDate = status.created_at ? new Date(status.created_at) : new Date();
-  const timestamp = Number.isNaN(parsedDate.getTime()) ? new Date().toISOString() : parsedDate.toISOString();
+  const parsedDate = note.published ? new Date(note.published) : null;
+  const timestamp =
+    parsedDate && !Number.isNaN(parsedDate.getTime())
+      ? parsedDate.toISOString()
+      : '1970-01-01T00:00:00.000Z';
   const statusHash = crypto
     .createHash('sha256')
-    .update(String(status.uri || `${host}:${status.id}`))
+    .update(String(note.uri || note.id))
     .digest('hex')
     .slice(0, 16);
 
@@ -780,16 +844,47 @@ async function routeFirehoseStatus(status: FediverseStatus, host: string): Promi
       pubkey: identity.publicKeyPem,
       sig,
       content_cid: null,
+      ...(note.author ? { author: note.author } : {}),
+      ...(note.authorUrl ? { author_url: note.authorUrl } : {}),
     };
     const saved = await saveMessage(msg);
     if (saved) {
+      console.log(`Ingested Fediverse post into ${board}: ${id}`);
       void pushMessageToPeers(msg, getKnownPeers(getSelfUrl()), getSelfUrl());
     }
   }
 }
 
-try {
-  await startFirehose({ onStatus: routeFirehoseStatus });
-} catch (err) {
-  console.error('Firehose error:', err);
+followRelays(activityPubDeps).catch((err) => {
+  console.error('ActivityPub relay follow error:', err);
+});
+
+async function handleFirehoseStatus(status: FediverseStatus, host: string): Promise<void> {
+  const tags = (status.tags || [])
+    .map((t) => String(t?.name || '').trim())
+    .filter(Boolean);
+  if (tags.length === 0) return;
+
+  const rawAcct = status.account?.acct || status.account?.username || '';
+  const author = rawAcct
+    ? `@${rawAcct.includes('@') ? rawAcct : `${rawAcct}@${host}`}`
+    : undefined;
+  const authorUrl = status.account?.url || status.url;
+
+  await routeIncomingNote({
+    id: status.id,
+    uri: status.uri || `${host}:${status.id}`,
+    url: status.url,
+    content: status.content || status.url || status.id,
+    published: status.created_at,
+    tags,
+    author,
+    authorUrl,
+  });
+}
+
+if (process.env.FIREHOSE_ENABLED !== '0' && process.env.FIREHOSE_ENABLED !== 'false') {
+  startFirehose({ onStatus: handleFirehoseStatus }).catch((err) => {
+    console.error('Firehose error:', err);
+  });
 }
